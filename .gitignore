@@ -1,0 +1,56 @@
+# Environment
+.env
+.env.*
+.venv/
+venv/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Logs / runtime
+*.log
+*.out
+logs/
+
+# Data directories (never track)
+data/
+tmp/
+artifacts/
+outputs/
+scripts/LLM_factors/
+factor_value_prepared/data/
+factor_correlation/output/
+
+# Data file types (safety net)
+*.parquet
+*.csv
+*.tsv
+*.feather
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pt
+*.ckpt
+*.onnx
+*.bin
+*.db
+*.sqlite
+
+1

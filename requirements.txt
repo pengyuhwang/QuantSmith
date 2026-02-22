@@ -1,0 +1,27 @@
+# Core runtime deps (aligned with pyproject.toml)
+numpy
+pandas
+scikit-learn
+pydantic
+PyYAML
+pyarrow
+KunQuant==0.1.7
+cmake
+ninja
+
+# Common script dependencies
+matplotlib
+seaborn
+scipy
+tqdm
+click
+joblib
+numba
+statsmodels
+xgboost
+arch
+TA-Lib
+requests
+python-dotenv
+openai
+loguru

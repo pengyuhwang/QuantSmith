@@ -1,0 +1,131 @@
+k: 10  # target number of clusters for CSS stage
+u: 5   # minimum factor count required before CoE expansion
+css:
+  n_select: 6
+  similarity_metric: "spearman"
+coe:
+  max_depth: 5
+  min_rankic: 0.05
+  prompt_chains: 6
+  # 提示中附带哪些指标（可选: ric, ic, icir）；留空/缺失则展示全部
+  prompt_metrics: ["ric"]
+  # benchmark_assets: ["000852.SH", "000905.SH"]
+  benchmark_assets: ["000905.SH"]
+  prompt_expr_chars: 0
+  ric_start_date: "2005-01-01"
+  ric_end_date: "2009-12-31"
+ric:
+  assets: ["000905.SH"]  # RIC 统一计算资产列表（workflow 筛选与 CoE 基础库评分共用）
+  min_obs: 1000  # 单资产-因子组合最小有效样本数
+  start_date: "2005-01-01"  # 留空表示不限制起始日期
+  end_date: "2009-12-31"  # 留空表示不限制结束日期
+run:
+  use_css: true
+  use_coe: true
+workflow:
+  iterations: 1000  # workflow 总迭代次数
+  ric_threshold: 0.08  # 新因子通过门槛：各目标资产上的最小 |RIC|
+  corr_threshold: 0.95  # 新因子 vs base 最大允许 |相关性|
+  llm_self_corr_threshold: 0.95  # 新因子 vs 历史LLM / 同轮新因子 最大允许 |相关性|
+  min_corr_obs: 1000  # 相关性计算最小重叠样本数
+base_catalog:
+  selected_sources: ["alpha101", "alpha158"]  # 运行时基础因子源选择（可选: alpha101, alpha158）
+  include_llm_library_in_base: true  # 是否将通过筛选的 LLM 正式库并入 base（true/false）
+backtest:
+  calendar_anchor_symbol: "000852.SH"  # prepare_price_data 交易日锚点资产（用于生成 working_days）
+paths:
+  market_data: "./data/fof_price_updating_intact.parquet"  # 行情原始数据（OHLCV）
+  base_alpha101_cache: "./data/factor_cache_new/alpha101.yaml"  # Alpha101 基础因子源
+  base_alpha158_cache: "./data/factor_cache_new/alpha158.yaml"  # Alpha158 基础因子源
+  base_factor_cache_resolved: "./tmp/base_factor_cache_resolved.yaml"  # 运行时合并后的 base 因子缓存（由 base_catalog 控制）
+  llm_factor_cache: "./data/factor_cache_new/LLM_factors.yaml"  # LLM 因子缓存库（新生成因子）
+  llm_factor_library: "./data/factor_cache_new/LLM_library.yaml"  # LLM 正式入库库（通过筛选后落盘）
+  factor_outputs: "./data/factor_values"  # 预留：因子值通用输出目录
+  prompts_dir: "./prompts"  # 预留：提示词模板目录
+  output_dir: "./artifacts"  # 预留：通用产物目录
+  factor_base_parquet: "./factor_value_prepared/data/factors/dsl_factors_new.parquet"  # 基础因子值长表（来自 base_catalog 解析结果）
+  factor_ric_base: "./factor_value_prepared/data/factors/factor_ric.csv"  # 基础库 RIC（由 utils/ric_engine.py 生成，供 CoE/CSS 使用）
+  factor_ric_llm: "./tmp/llm_factor_ric.csv"  # LLM 新因子 RIC（workflow 每轮覆盖输出）
+  llm_output: "./tmp/llm-factor.yaml"  # LLM 原始输出落盘（本轮表达式）
+  llm_factor_parquet: "./scripts/LLM_factors/dsl_LLM_factors_new.parquet"  # LLM 因子值长表输出
+  base_factor_dir: "./data/base_factors"  # 基础因子值目录（用于相关性筛选）
+  corr_output_new_vs_base: "./tmp/new_llm_vs_base_corr.csv"  # 本轮新 LLM vs 基础因子相关性结果
+  corr_output_new_vs_old_llm: "./tmp/new_llm_vs_old_llm_corr.csv"  # 本轮新 LLM vs 历史 LLM 相关性结果
+  corr_output_new_vs_new_llm: "./tmp/new_llm_vs_new_llm_corr.csv"  # 本轮新 LLM 之间相关性结果（同轮去重）
+  corr_output: "./tmp/new_llm_vs_base_corr.csv"  # 兼容旧键：等同 corr_output_new_vs_base
+llm:
+#  provider: "openai"
+#  model: "gpt-5.2"
+#  api_key_env: "OPENAI_API_KEY"
+  provider: "siliconflow"
+  model: "Pro/deepseek-ai/DeepSeek-V3.2"
+  base_url: "https://api.siliconflow.cn/v1"
+  api_key_env: "SiliconFlow_API_KEY"
+  temperature: 1
+  thinking: "high"
+  parallel_calls: 1
+  max_new_factors: 15
+  max_reference_factors: 5
+  max_reference_pool: 100
+  instructions_path: "./prompts/alpha_prompt_template.txt"
+
+
+  operator_whitelist:
+    [
+      #"RANK",
+      "DELTA",
+      "DELAY",
+      "TS_MEAN",
+      "TS_SUM",
+      "TS_STDDEV",
+      "TS_MIN",
+      "TS_MAX",
+      "TS_PRODUCT",
+      "TS_ARGMAX",
+      "TS_ARGMIN",
+      "TS_RANK",
+      "CORREL",
+      "COVAR",
+      "SIGN",
+      "ABS",
+      "DECAY_LINEAR",
+      #"SCALE",
+      "IF",
+      "AND",
+      "OR",
+      "NOT",
+      "GT",
+      "GE",
+      "LT",
+      "LE",
+      "EQ",
+      "MAX",
+      "MIN",
+      "LOG",
+      "EXP",
+      "POW",
+      "REPLACE_NAN_INF",
+      "ADV",
+      "SAFE_DIV",
+      "CLIP",
+      "EMA",
+      "EXP_MOVING_AVG",
+      "FAST_TS_SUM",
+      "TS_QUANTILE",
+      "TS_KURT",
+      "TS_SKEW",
+      "TS_MAXDRAWDOWN",
+      "TS_LINEAR_REGRESSION_R2",
+      "TS_LINEAR_REGRESSION_SLOPE",
+      "TS_LINEAR_REGRESSION_RESI",
+      #"DIFF_WITH_WEIGHTED_SUM",
+    ]
+  deny_fields: []
+logging:
+  level: "INFO"
+  log_file: "./logs/fama.log"
+compute:
+  use_kunquant: true
+  threads: 4
+  layout: "TS"
+  kun_batch_size: 500  # KunQuant 默认编译批大小（未显式传 batch_size 时生效）

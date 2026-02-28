@@ -24,10 +24,24 @@ run:
   use_coe: true
 workflow:
   iterations: 1000  # workflow 总迭代次数
+  # 兼容旧键：以下阈值建议迁移到 selection.* 管理
+#  ric_threshold: 0.08
+#  corr_threshold: 0.95
+#  llm_self_corr_threshold: 0.95
+#  min_corr_obs: 1000
+selection:
   ric_threshold: 0.08  # 新因子通过门槛：各目标资产上的最小 |RIC|
   corr_threshold: 0.95  # 新因子 vs base 最大允许 |相关性|
   llm_self_corr_threshold: 0.95  # 新因子 vs 历史LLM / 同轮新因子 最大允许 |相关性|
   min_corr_obs: 1000  # 相关性计算最小重叠样本数
+  require_full_asset_coverage: true  # RIC 是否要求覆盖全部目标资产
+  enable_new_vs_old_llm: true  # 是否启用 new-vs-old-llm 去重
+  enable_new_vs_new_llm: true  # 是否启用同轮 new-vs-new-llm 去重
+  dedup_strategy: "greedy_by_min_abs_ric"  # 当前支持: greedy_by_min_abs_ric
+  log_topk: 3  # 日志展示每个阶段 TopK 相关性摘要
+  scope:
+    use_ric_assets: true  # 相关性筛选是否沿用 ric.assets
+    use_ric_window: true  # 相关性筛选是否沿用 ric.start_date/end_date
 base_catalog:
   selected_sources: ["alpha101", "alpha158"]  # 运行时基础因子源选择（可选: alpha101, alpha158）
   include_llm_library_in_base: true  # 是否将通过筛选的 LLM 正式库并入 base（true/false）

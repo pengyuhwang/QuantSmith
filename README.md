@@ -112,13 +112,16 @@ LLMQuant/
 
 核心配置文件：`fama/config/defaults.yaml`
 
-### 4.1 workflow 超参数
+### 4.1 workflow / selection 超参数
 
 - `workflow.iterations`：迭代轮数
-- `workflow.ric_threshold`：新因子 RIC 门槛（按目标资产逐个校验）
-- `workflow.corr_threshold`：new-vs-base 最大允许相关性
-- `workflow.llm_self_corr_threshold`：new-vs-old/new-vs-new 最大允许相关性
-- `workflow.min_corr_obs`：相关性最小重叠样本
+- `selection.ric_threshold`：新因子 RIC 门槛（按目标资产逐个校验）
+- `selection.corr_threshold`：new-vs-base 最大允许相关性
+- `selection.llm_self_corr_threshold`：new-vs-old/new-vs-new 最大允许相关性
+- `selection.min_corr_obs`：相关性最小重叠样本
+
+兼容说明：
+- `workflow.ric_threshold / corr_threshold / llm_self_corr_threshold / min_corr_obs` 仍可作为回退键，但建议统一迁移到 `selection.*`。
 
 ### 4.2 RIC 参数
 

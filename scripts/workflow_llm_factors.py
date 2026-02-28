@@ -6,24 +6,28 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
-from typing import Iterable
 
 import pandas as pd
 
 from fama.cli import _load_config
 from fama.mining.orchestrator import PromptOrchestrator
 from utils.factor_collection_dsl import FactorCollectionDSLNew
-from utils.compute_correlation_new import (
-    compute_pairwise_corr,
-    load_base_factors,
-    load_llm_factors,
-)
+from utils.compute_correlation_new import load_base_factors, load_llm_factors
 from fama.data.factor_space import deserialize_factor_set, serialize_factor_set, Factor, FactorSet
 from fama.utils.io import ensure_dir
 from fama.data.dataloader import available_factor_inputs, load_market_data
 from fama.factors.alpha_lib import validate_alpha_syntax_strict
 from utils.factor_catalog import load_factor_name_set, resolve_base_factor_cache
 from utils.ric_engine import compute_rankic_from_files, resolve_ric_params
+from fama.selection.config import apply_selection_overrides, load_selection_config
+from fama.selection.models import SelectionInput, empty_corr_df
+from fama.selection.pipeline import run_selection_pipeline
+from fama.selection.reporting import (
+    apply_corr_scope,
+    corr_input_summary,
+    format_ric_passed_details,
+    top_self_corr,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LLM_DSL_COLLECTION_KWARGS = {
@@ -58,19 +62,19 @@ def parse_args() -> argparse.Namespace:
         "--ric-threshold",
         type=float,
         default=None,
-        help="RIC threshold per asset. Omit to follow cfg.workflow.ric_threshold.",
+        help="RIC threshold per asset. Omit to follow cfg.selection.ric_threshold (fallback cfg.workflow.ric_threshold).",
     )
     parser.add_argument(
         "--corr-threshold",
         type=float,
         default=None,
-        help="Max absolute correlation vs base factors. Omit to follow cfg.workflow.corr_threshold.",
+        help="Max absolute correlation vs base factors. Omit to follow cfg.selection.corr_threshold (fallback cfg.workflow.corr_threshold).",
     )
     parser.add_argument(
         "--llm-self-corr-threshold",
         type=float,
         default=None,
-        help="Max absolute correlation for new-vs-old and new-vs-new LLM filtering. Omit to follow cfg.workflow.llm_self_corr_threshold.",
+        help="Max absolute correlation for new-vs-old and new-vs-new LLM filtering. Omit to follow cfg.selection.llm_self_corr_threshold (fallback cfg.workflow.llm_self_corr_threshold).",
     )
     parser.add_argument(
         "--assets",
@@ -88,7 +92,7 @@ def parse_args() -> argparse.Namespace:
         "--min-corr-obs",
         type=int,
         default=None,
-        help="Minimum overlapping obs for correlation. Omit to follow cfg.workflow.min_corr_obs.",
+        help="Minimum overlapping obs for correlation. Omit to follow cfg.selection.min_corr_obs (fallback cfg.workflow.min_corr_obs).",
     )
     parser.add_argument(
         "--llm-output",
@@ -143,165 +147,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def filter_by_thresholds(
-    ric_df: pd.DataFrame,
-    corr_df: pd.DataFrame,
-    ric_threshold: float,
-    corr_threshold: float,
-    assets: Iterable[str],
-) -> list[str]:
-    """Return factor names that pass all thresholds."""
-
-    assets = list(assets)
-    if ric_df is None or ric_df.empty:
-        return []
-
-    asset_col = "asset" if "asset" in ric_df.columns else "unique_id"
-    if asset_col not in ric_df.columns:
-        raise ValueError("RIC 表缺少资产列（asset/unique_id）。")
-
-    # RIC filter: factor must exist for all assets and clear the |RIC| threshold
-    ric_subset = ric_df[ric_df[asset_col].isin(assets)].copy()
-    ric_subset["abs_ric"] = ric_subset["ric"].abs()
-    ric_grouped = ric_subset.groupby("factor_tag").agg(
-        asset_coverage=(asset_col, "nunique"),
-        min_abs_ric=("abs_ric", "min"),
-    )
-    ric_pass = set(
-        ric_grouped[
-            (ric_grouped["asset_coverage"] == len(assets))
-            & (ric_grouped["min_abs_ric"] >= ric_threshold)
-        ].index
-    )
-
-    if corr_df is None or corr_df.empty:
-        # 没有相关性数据时，只根据 RIC 返回
-        return sorted(ric_pass)
-
-    # Correlation filter: max abs corr vs base factors below threshold
-    corr_max = corr_df.groupby("llm_factor")["abs_corr"].max()
-    corr_pass = {
-        factor
-        for factor in ric_pass
-        # 缺少相关性结果视为不通过，确保有观测才入库
-        if (factor in corr_max.index) and (corr_max.loc[factor] <= corr_threshold)
-    }
-
-    return sorted(ric_pass & corr_pass)
-
-
-def dedup_new_factors_by_self_corr(
-    candidates: list[str],
-    self_corr_df: pd.DataFrame,
-    ric_df: pd.DataFrame,
-    threshold: float,
-) -> tuple[list[str], list[str]]:
-    """Greedy dedup for new factors using self-correlation, keep stronger RIC first."""
-
-    if not candidates:
-        return [], []
-    if self_corr_df is None or self_corr_df.empty:
-        return sorted(candidates), []
-
-    pair_df = self_corr_df[self_corr_df["llm_factor"] != self_corr_df["base_factor"]].copy()
-    pair_df = pair_df[
-        pair_df["llm_factor"].isin(candidates)
-        & pair_df["base_factor"].isin(candidates)
-    ]
-    pair_df = pair_df[pair_df["abs_corr"] > threshold]
-    if pair_df.empty:
-        return sorted(candidates), []
-
-    ric_strength = (
-        ric_df[ric_df["factor_tag"].isin(candidates)]
-        .assign(abs_ric=lambda df: df["ric"].abs())
-        .groupby("factor_tag")["abs_ric"]
-        .min()
-    )
-
-    ordered = sorted(
-        candidates,
-        key=lambda name: (-float(ric_strength.get(name, 0.0)), name),
-    )
-    adjacency: dict[str, set[str]] = {name: set() for name in candidates}
-    for row in pair_df.itertuples():
-        lhs = str(row.llm_factor)
-        rhs = str(row.base_factor)
-        if lhs == rhs:
-            continue
-        adjacency.setdefault(lhs, set()).add(rhs)
-        adjacency.setdefault(rhs, set()).add(lhs)
-
-    kept: list[str] = []
-    dropped: set[str] = set()
-    for factor in ordered:
-        if factor in dropped:
-            continue
-        kept.append(factor)
-        for peer in adjacency.get(factor, set()):
-            if peer not in kept:
-                dropped.add(peer)
-
-    return sorted(kept), sorted(dropped)
-
-
-def _apply_corr_scope(
-    df: pd.DataFrame,
-    assets: Iterable[str] | None,
-    start_date: str | None,
-    end_date: str | None,
-) -> pd.DataFrame:
-    """Apply the same scope filters as compute_pairwise_corr for preview logging."""
-
-    if df is None or df.empty:
-        return df
-    scoped = df
-    if assets:
-        assets_set = {str(asset) for asset in assets}
-        if "unique_id" in scoped.columns:
-            scoped = scoped[scoped["unique_id"].astype(str).isin(assets_set)]
-    if "time" in scoped.columns:
-        time_series = pd.to_datetime(scoped["time"], errors="coerce")
-        if start_date:
-            scoped = scoped[time_series >= pd.to_datetime(start_date)]
-            time_series = pd.to_datetime(scoped["time"], errors="coerce")
-        if end_date:
-            scoped = scoped[time_series <= pd.to_datetime(end_date)]
-    return scoped
-
-
-def _factor_sample(df: pd.DataFrame, limit: int = 5) -> str:
-    if df is None or df.empty or "factor_tag" not in df.columns:
-        return "none"
-    factors = sorted({str(item) for item in df["factor_tag"].dropna().tolist()})
-    if not factors:
-        return "none"
-    if len(factors) <= limit:
-        return ", ".join(factors)
-    return f"{', '.join(factors[:limit])} ..."
-
-
-def _corr_input_summary(df: pd.DataFrame, *, label: str) -> str:
-    """Build a concise, readable summary for correlation input tables."""
-
-    if df is None or df.empty:
-        return f"{label}: factors=0 [none] | rows=0 | assets=0 | window=N/A->N/A"
-    factor_cnt = int(df["factor_tag"].nunique()) if "factor_tag" in df.columns else 0
-    asset_cnt = int(df["unique_id"].nunique()) if "unique_id" in df.columns else 0
-    if "time" in df.columns:
-        ts = pd.to_datetime(df["time"], errors="coerce").dropna()
-        if ts.empty:
-            window = "N/A->N/A"
-        else:
-            window = f"{ts.min().date()}->{ts.max().date()}"
-    else:
-        window = "N/A->N/A"
-    return (
-        f"{label}: factors={factor_cnt} [{_factor_sample(df)}] | "
-        f"rows={len(df)} | assets={asset_cnt} | window={window}"
-    )
-
-
 def append_to_factor_cache(
     factors_path: Path,
     expressions: dict[str, str],
@@ -330,28 +175,20 @@ def main() -> None:
     cfg["_config_path"] = str(Path(args.config).expanduser().resolve())
     paths = cfg.setdefault("paths", {})
     workflow_cfg = cfg.get("workflow", {}) if isinstance(cfg.get("workflow"), dict) else {}
+    selection_cfg = load_selection_config(cfg)
 
     args.iterations = int(args.iterations) if args.iterations is not None else int(workflow_cfg.get("iterations", 1000))
-    args.ric_threshold = (
-        float(args.ric_threshold)
-        if args.ric_threshold is not None
-        else float(workflow_cfg.get("ric_threshold", 0.08))
+    selection_cfg = apply_selection_overrides(
+        selection_cfg,
+        ric_threshold=args.ric_threshold,
+        corr_threshold=args.corr_threshold,
+        llm_self_corr_threshold=args.llm_self_corr_threshold,
+        min_corr_obs=args.min_corr_obs,
     )
-    args.corr_threshold = (
-        float(args.corr_threshold)
-        if args.corr_threshold is not None
-        else float(workflow_cfg.get("corr_threshold", 0.65))
-    )
-    args.llm_self_corr_threshold = (
-        float(args.llm_self_corr_threshold)
-        if args.llm_self_corr_threshold is not None
-        else float(workflow_cfg.get("llm_self_corr_threshold", 0.7))
-    )
-    args.min_corr_obs = (
-        int(args.min_corr_obs)
-        if args.min_corr_obs is not None
-        else int(workflow_cfg.get("min_corr_obs", 1000))
-    )
+    args.ric_threshold = float(selection_cfg.ric_threshold)
+    args.corr_threshold = float(selection_cfg.corr_threshold)
+    args.llm_self_corr_threshold = float(selection_cfg.llm_self_corr_threshold)
+    args.min_corr_obs = int(selection_cfg.min_corr_obs)
 
     if args.iterations <= 0:
         raise ValueError(f"iterations 必须为正整数，当前={args.iterations}")
@@ -453,7 +290,13 @@ def main() -> None:
         "[workflow] Runtime params | "
         f"ric_assets={','.join(ric_assets)} | min_ric_obs={min_ric_obs} | "
         f"ric_threshold={args.ric_threshold} | corr_threshold={args.corr_threshold} | "
-        f"llm_self_corr_threshold={args.llm_self_corr_threshold}"
+        f"llm_self_corr_threshold={args.llm_self_corr_threshold} | min_corr_obs={args.min_corr_obs}"
+    )
+    print(
+        "[workflow] Selection switches | "
+        f"new_vs_old_llm={selection_cfg.enable_new_vs_old_llm} | "
+        f"new_vs_new_llm={selection_cfg.enable_new_vs_new_llm} | "
+        f"require_full_asset_coverage={selection_cfg.require_full_asset_coverage}"
     )
     print(
         "[workflow] Base catalog | "
@@ -537,7 +380,6 @@ def main() -> None:
         if len(cleaned) != len(items):
             serialize_factor_set(FactorSet(cleaned), str(llm_cache_path))
 
-        collector = FactorCollectionDSLNew(config_path=args.config, **LLM_DSL_COLLECTION_KWARGS)
         # Identify newly added factors after orchestrator run
         llm_fs_after = deserialize_factor_set(str(llm_cache_path))
         new_factors = [f for f in llm_fs_after.factors if f.name not in existing_names]
@@ -609,225 +451,195 @@ def main() -> None:
         )
         print(f"[workflow] compute_rankic_from_files finished | elapsed={time.perf_counter() - stage_started:.2f}s")
 
-        # 4) Correlation vs base factors (only for RIC-passed factors)
-        # Filter RIC to new factors only
-        ric_df = ric_df[ric_df["factor_tag"].isin({f.name for f in new_factors})]
-        ric_passed = set(filter_by_thresholds(ric_df, None, args.ric_threshold, 1.0, ric_assets))
-        if not ric_passed:
-            print("[workflow] No factors passed RIC thresholds; skip correlation and continue.")
+        # 4) Selection pipeline: RIC gate + new-vs-base + new-vs-old-llm + new-vs-new-llm
+        new_factor_names = {f.name for f in new_factors}
+        ric_df = ric_df[ric_df["factor_tag"].isin(new_factor_names)]
+        if ric_df.empty:
+            print("[workflow] RIC 表中不存在本轮新因子，跳过本轮。")
             print(f"[workflow] Iteration elapsed={time.perf_counter() - iter_started:.2f}s")
             continue
 
         llm_df = load_llm_factors(Path(llm_parquet))
-        llm_df = llm_df[llm_df["factor_tag"].isin(ric_passed)]
+        llm_df = llm_df[llm_df["factor_tag"].isin(new_factor_names)]
         if llm_df.empty:
-            print("[workflow] No LLM factors remain after RIC filter; continue to next iteration.")
+            print("[workflow] 新因子值表中不存在可筛选因子，跳过本轮。")
             print(f"[workflow] Iteration elapsed={time.perf_counter() - iter_started:.2f}s")
             continue
+
         base_df = load_base_factors(base_factor_dir)
         # base_df = base_df[base_df["factor_tag"].isin(base_factor_name_set)]
         if base_df.empty:
             raise RuntimeError(
                 f"base_factor_dir 中未找到选定 base 因子，请检查 base 源与目录是否一致: {base_factor_dir}"
             )
-        llm_df_scope = _apply_corr_scope(llm_df, ric_assets, ric_start, ric_end)
-        base_df_scope = _apply_corr_scope(base_df, ric_assets, ric_start, ric_end)
+
+        llm_df_scope = apply_corr_scope(llm_df, ric_assets, ric_start, ric_end)
+        base_df_scope = apply_corr_scope(base_df, ric_assets, ric_start, ric_end)
         print(
             f"[workflow] Corr[new_vs_base] scope | assets={','.join(ric_assets)} | "
             f"window={ric_start or 'unbounded'}->{ric_end or 'unbounded'} | min_obs={args.min_corr_obs}"
         )
-        print(f"[workflow] Corr[new_vs_base] {_corr_input_summary(llm_df_scope, label='new(passed_ric)')}")
-        print(f"[workflow] Corr[new_vs_base] {_corr_input_summary(base_df_scope, label='base(reference_dir)')}")
-        print("[workflow] Corr[new_vs_base] computing pairwise correlations...")
-        stage_started = time.perf_counter()
-        corr_df = compute_pairwise_corr(
-            llm_df,
-            base_df,
-            min_obs=args.min_corr_obs,
-            assets=ric_assets,
-            start_date=ric_start,
-            end_date=ric_end,
-        )
-        corr_pairs = len(corr_df) if corr_df is not None else 0
-        corr_llm_factors = int(corr_df["llm_factor"].nunique()) if corr_df is not None and not corr_df.empty else 0
-        print(
-            f"[workflow] Corr[new_vs_base] done | pairs={corr_pairs} | llm_factors={corr_llm_factors} | "
-            f"elapsed={time.perf_counter() - stage_started:.2f}s"
-        )
-        ensure_dir(str(corr_output_new_vs_base_path.parent))
-        corr_df.to_csv(corr_output_new_vs_base_path, index=False)
+        print(f"[workflow] Corr[new_vs_base] {corr_input_summary(llm_df_scope, label='new(iteration_raw)')}")
+        print(f"[workflow] Corr[new_vs_base] {corr_input_summary(base_df_scope, label='base(reference_dir)')}")
 
-        # RIC 通过因子的对照输出（含 Top1 相关性）
-        print("[workflow] RIC 通过的因子明细：")
-        for factor in sorted(ric_passed):
-            ric_rows = ric_df[ric_df["factor_tag"] == factor]
-            ric_str = "; ".join(f"{row.asset}:{row.ric:.4f}" for row in ric_rows.itertuples())
-            top_corr_str = "无"
-            if corr_df is not None and not corr_df.empty:
-                top_corr = (
-                    corr_df[corr_df["llm_factor"] == factor]
-                    .sort_values("abs_corr", ascending=False)
-                    .head(1)
-                )
-                if not top_corr.empty:
-                    row = top_corr.iloc[0]
-                    top_corr_str = f"{row['base_factor']}:{row['weighted_corr']:.4f}(|{row['abs_corr']:.4f}|)"
-            print(f"  - {factor} | RIC[{ric_str}] | TopCorr[{top_corr_str}]")
-
-        # 5) Filter and append to factor cache
-        passed = filter_by_thresholds(
-            ric_df,
-            corr_df,
-            ric_threshold=args.ric_threshold,
-            corr_threshold=args.corr_threshold,
-            assets=ric_assets,
-        )
-        if not passed:
-            print("[workflow] No factors passed thresholds; continue to next iteration.")
-            print(f"[workflow] Iteration elapsed={time.perf_counter() - iter_started:.2f}s")
-            continue
-
-        # 4.1) Correlation: new-llm vs old-llm
         factor_cache_path = llm_factor_library_path
         try:
             factor_cache_fs = deserialize_factor_set(str(factor_cache_path))
         except Exception:
             factor_cache_fs = FactorSet([])
         historical_llm = [f for f in factor_cache_fs.factors if "LLM" in f.name.upper()]
-        corr_cols = ["llm_factor", "base_factor", "weighted_corr", "abs_corr", "total_obs", "asset_pairs"]
-        self_corr_old_df = pd.DataFrame(columns=corr_cols)
-        if historical_llm and passed:
-            existing_cache_path = PROJECT_ROOT / "tmp" / "llm_factor_cache_existing.yaml"
-            ensure_dir(str(existing_cache_path.parent))
-            serialize_factor_set(FactorSet(historical_llm), str(existing_cache_path))
-            collector_existing = FactorCollectionDSLNew(
-                config_path=args.config,
-                factor_cache_path=existing_cache_path,
-                **LLM_DSL_COLLECTION_KWARGS,
-            )
-            existing_parquet = collector_existing.update_dsl_factors(
-                output_path=llm_factor_parquet_path.parent / "existing_llm_factors.parquet",
-                batch_size=100,
-            )
-            existing_df = load_llm_factors(Path(existing_parquet))
-            llm_df_passed = llm_df[llm_df["factor_tag"].isin(passed)]
-            llm_df_passed_scope = _apply_corr_scope(llm_df_passed, ric_assets, ric_start, ric_end)
-            existing_df_scope = _apply_corr_scope(existing_df, ric_assets, ric_start, ric_end)
-            print(
-                f"[workflow] Corr[new_vs_old_llm] scope | assets={','.join(ric_assets)} | "
-                f"window={ric_start or 'unbounded'}->{ric_end or 'unbounded'} | min_obs={args.min_corr_obs}"
-            )
-            print(
-                f"[workflow] Corr[new_vs_old_llm] "
-                f"{_corr_input_summary(llm_df_passed_scope, label='new(passed_thresholds)')}"
-            )
-            print(
-                f"[workflow] Corr[new_vs_old_llm] "
-                f"{_corr_input_summary(existing_df_scope, label='old(llm_library)')}"
-            )
-            print("[workflow] Corr[new_vs_old_llm] computing pairwise correlations...")
-            stage_started = time.perf_counter()
-            self_corr_old_df = compute_pairwise_corr(
-                llm_df_passed,
-                existing_df,
-                min_obs=args.min_corr_obs,
-                assets=ric_assets,
+
+        old_llm_loader = None
+        if historical_llm:
+            def _load_existing_llm_df() -> pd.DataFrame:
+                existing_cache_path = PROJECT_ROOT / "tmp" / "llm_factor_cache_existing.yaml"
+                ensure_dir(str(existing_cache_path.parent))
+                serialize_factor_set(FactorSet(historical_llm), str(existing_cache_path))
+                collector_existing = FactorCollectionDSLNew(
+                    config_path=args.config,
+                    factor_cache_path=existing_cache_path,
+                    **LLM_DSL_COLLECTION_KWARGS,
+                )
+                print("[workflow] Prepare historical LLM factor values for new-vs-old-llm correlation...")
+                existing_parquet = collector_existing.update_dsl_factors(
+                    output_path=llm_factor_parquet_path.parent / "existing_llm_factors.parquet",
+                    batch_size=100,
+                )
+                existing_df = load_llm_factors(Path(existing_parquet))
+                existing_df_scope = apply_corr_scope(existing_df, ric_assets, ric_start, ric_end)
+                print(f"[workflow] Corr[new_vs_old_llm] {corr_input_summary(existing_df_scope, label='old(llm_library)')}")
+                return existing_df
+
+            old_llm_loader = _load_existing_llm_df
+
+        print("[workflow] Call selection.run_selection_pipeline")
+        stage_started = time.perf_counter()
+        selection_result = run_selection_pipeline(
+            SelectionInput(
+                ric_df=ric_df,
+                new_llm_df=llm_df,
+                base_df=base_df,
+                assets=[str(asset) for asset in ric_assets],
                 start_date=ric_start,
                 end_date=ric_end,
-            )
-            old_pairs = len(self_corr_old_df) if self_corr_old_df is not None else 0
+                old_llm_df_loader=old_llm_loader,
+            ),
+            selection_cfg,
+        )
+        print(
+            f"[workflow] selection.run_selection_pipeline finished | "
+            f"elapsed={time.perf_counter() - stage_started:.2f}s"
+        )
+
+        corr_df = selection_result.corr_new_vs_base if selection_result.corr_new_vs_base is not None else empty_corr_df()
+        corr_pairs = len(corr_df) if corr_df is not None else 0
+        corr_llm_factors = int(corr_df["llm_factor"].nunique()) if corr_df is not None and not corr_df.empty else 0
+        print(
+            f"[workflow] Corr[new_vs_base] done | pairs={corr_pairs} | llm_factors={corr_llm_factors} | "
+            f"elapsed={selection_result.elapsed_new_vs_base:.2f}s"
+        )
+        ensure_dir(str(corr_output_new_vs_base_path.parent))
+        corr_df.to_csv(corr_output_new_vs_base_path, index=False)
+
+        ric_passed = set(selection_result.ric_passed_factors)
+        if not ric_passed:
+            print("[workflow] No factors passed RIC thresholds; skip correlation and continue.")
+            print(f"[workflow] Iteration elapsed={time.perf_counter() - iter_started:.2f}s")
+            continue
+
+        print("[workflow] RIC 通过的因子明细：")
+        for detail_line in format_ric_passed_details(ric_df, corr_df, ric_passed):
+            print(detail_line)
+
+        self_corr_old_df = (
+            selection_result.corr_new_vs_old_llm
+            if selection_result.corr_new_vs_old_llm is not None
+            else empty_corr_df()
+        )
+        print(
+            f"[workflow] Corr[new_vs_old_llm] scope | assets={','.join(ric_assets)} | "
+            f"window={ric_start or 'unbounded'}->{ric_end or 'unbounded'} | min_obs={args.min_corr_obs}"
+        )
+        if selection_result.old_llm_gate_applied:
+            llm_df_base_passed = llm_df[llm_df["factor_tag"].isin(set(selection_result.passed_after_base_corr))]
+            llm_df_base_scope = apply_corr_scope(llm_df_base_passed, ric_assets, ric_start, ric_end)
+            print(f"[workflow] Corr[new_vs_old_llm] {corr_input_summary(llm_df_base_scope, label='new(passed_base_corr)')}")
             print(
-                f"[workflow] Corr[new_vs_old_llm] done | pairs={old_pairs} | "
-                f"elapsed={time.perf_counter() - stage_started:.2f}s"
+                f"[workflow] Corr[new_vs_old_llm] done | pairs={len(self_corr_old_df)} | "
+                f"elapsed={selection_result.elapsed_new_vs_old_llm:.2f}s"
             )
             if self_corr_old_df.empty:
-                self_corr_old_df = pd.DataFrame(columns=corr_cols)
                 print("[workflow] No overlap to compute new-vs-old-llm correlation.")
             else:
-                top_self_corr_old = (
-                    self_corr_old_df.sort_values("abs_corr", ascending=False)
-                    .groupby("llm_factor", as_index=False)
-                    .first()
-                )
                 print("[workflow] Top self-corr: new-llm vs old-llm:")
-                for row in top_self_corr_old.itertuples():
+                for row in top_self_corr(self_corr_old_df).itertuples():
                     print(
                         f"  - {row.llm_factor} vs {row.base_factor} | corr={row.weighted_corr:.4f} "
                         f"|abs|={row.abs_corr:.4f} | obs={row.total_obs}"
                     )
-                self_corr_max = self_corr_old_df.groupby("llm_factor")["abs_corr"].max()
-                drop = {factor for factor, val in self_corr_max.items() if val > args.llm_self_corr_threshold}
-                if drop:
-                    print(
-                        f"[workflow] Dropped {len(drop)} factors due to new-vs-old-llm corr > {args.llm_self_corr_threshold}: "
-                        f"{', '.join(sorted(drop))}"
-                    )
-                    passed = [p for p in passed if p not in drop]
+            if selection_result.dropped_by_old_llm_corr:
+                print(
+                    f"[workflow] Dropped {len(selection_result.dropped_by_old_llm_corr)} factors due to "
+                    f"new-vs-old-llm corr > {args.llm_self_corr_threshold}: "
+                    f"{', '.join(selection_result.dropped_by_old_llm_corr)}"
+                )
         else:
-            print("[workflow] No historical LLM factors for new-vs-old-llm correlation.")
+            if not historical_llm:
+                print("[workflow] No historical LLM factors for new-vs-old-llm correlation.")
+            else:
+                print(
+                    "[workflow] Skip new-vs-old-llm correlation: "
+                    f"{selection_result.old_llm_gate_reason or 'no_reason'}"
+                )
         ensure_dir(str(corr_output_new_vs_old_llm_path.parent))
         self_corr_old_df.to_csv(corr_output_new_vs_old_llm_path, index=False)
 
-        # 4.2) Correlation: new-llm vs new-llm (same iteration), then dedup
-        self_corr_new_df = pd.DataFrame(columns=corr_cols)
-        if len(passed) >= 2:
-            llm_df_passed = llm_df[llm_df["factor_tag"].isin(passed)]
-            llm_df_passed_scope = _apply_corr_scope(llm_df_passed, ric_assets, ric_start, ric_end)
+        self_corr_new_df = (
+            selection_result.corr_new_vs_new_llm
+            if selection_result.corr_new_vs_new_llm is not None
+            else empty_corr_df()
+        )
+        print(
+            f"[workflow] Corr[new_vs_new_llm] scope | assets={','.join(ric_assets)} | "
+            f"window={ric_start or 'unbounded'}->{ric_end or 'unbounded'} | min_obs={args.min_corr_obs}"
+        )
+        if selection_result.new_llm_gate_applied:
+            pre_new_gate = [
+                factor
+                for factor in selection_result.passed_after_base_corr
+                if factor not in set(selection_result.dropped_by_old_llm_corr)
+            ]
+            llm_df_pre_new = llm_df[llm_df["factor_tag"].isin(set(pre_new_gate))]
+            llm_df_pre_new_scope = apply_corr_scope(llm_df_pre_new, ric_assets, ric_start, ric_end)
+            print(f"[workflow] Corr[new_vs_new_llm] {corr_input_summary(llm_df_pre_new_scope, label='new(candidates)')}")
             print(
-                f"[workflow] Corr[new_vs_new_llm] scope | assets={','.join(ric_assets)} | "
-                f"window={ric_start or 'unbounded'}->{ric_end or 'unbounded'} | min_obs={args.min_corr_obs}"
+                f"[workflow] Corr[new_vs_new_llm] done | pairs={len(self_corr_new_df)} | "
+                f"elapsed={selection_result.elapsed_new_vs_new_llm:.2f}s"
             )
-            print(
-                f"[workflow] Corr[new_vs_new_llm] "
-                f"{_corr_input_summary(llm_df_passed_scope, label='new(candidates)')}"
-            )
-            print("[workflow] Corr[new_vs_new_llm] computing pairwise correlations...")
-            stage_started = time.perf_counter()
-            self_corr_new_df = compute_pairwise_corr(
-                llm_df_passed,
-                llm_df_passed,
-                min_obs=args.min_corr_obs,
-                assets=ric_assets,
-                start_date=ric_start,
-                end_date=ric_end,
-            )
-            new_pairs = len(self_corr_new_df) if self_corr_new_df is not None else 0
-            print(
-                f"[workflow] Corr[new_vs_new_llm] done | pairs={new_pairs} | "
-                f"elapsed={time.perf_counter() - stage_started:.2f}s"
-            )
-            if not self_corr_new_df.empty:
-                self_corr_new_df = self_corr_new_df[self_corr_new_df["llm_factor"] != self_corr_new_df["base_factor"]]
             if self_corr_new_df.empty:
-                self_corr_new_df = pd.DataFrame(columns=corr_cols)
                 print("[workflow] No overlap to compute new-vs-new-llm correlation.")
             else:
-                top_self_corr_new = (
-                    self_corr_new_df.sort_values("abs_corr", ascending=False)
-                    .groupby("llm_factor", as_index=False)
-                    .first()
-                )
                 print("[workflow] Top self-corr: new-llm vs new-llm:")
-                for row in top_self_corr_new.itertuples():
+                for row in top_self_corr(self_corr_new_df).itertuples():
                     print(
                         f"  - {row.llm_factor} vs {row.base_factor} | corr={row.weighted_corr:.4f} "
                         f"|abs|={row.abs_corr:.4f} | obs={row.total_obs}"
                     )
-                passed, drop_new = dedup_new_factors_by_self_corr(
-                    candidates=list(passed),
-                    self_corr_df=self_corr_new_df,
-                    ric_df=ric_df,
-                    threshold=args.llm_self_corr_threshold,
+            if selection_result.dropped_by_new_llm_corr:
+                print(
+                    f"[workflow] Dropped {len(selection_result.dropped_by_new_llm_corr)} factors due to "
+                    f"new-vs-new-llm corr > {args.llm_self_corr_threshold}: "
+                    f"{', '.join(selection_result.dropped_by_new_llm_corr)}"
                 )
-                if drop_new:
-                    print(
-                        f"[workflow] Dropped {len(drop_new)} factors due to new-vs-new-llm corr > {args.llm_self_corr_threshold}: "
-                        f"{', '.join(drop_new)}"
-                    )
         else:
-            print("[workflow] Less than 2 passed factors; skip new-vs-new-llm correlation.")
+            print(
+                "[workflow] Skip new-vs-new-llm correlation: "
+                f"{selection_result.new_llm_gate_reason or 'no_reason'}"
+            )
         ensure_dir(str(corr_output_new_vs_new_llm_path.parent))
         self_corr_new_df.to_csv(corr_output_new_vs_new_llm_path, index=False)
+
+        passed = selection_result.passed_factors
         if not passed:
             print("[workflow] No factors passed thresholds; continue to next iteration.")
             print(f"[workflow] Iteration elapsed={time.perf_counter() - iter_started:.2f}s")

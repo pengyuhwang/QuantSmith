@@ -20,6 +20,7 @@ from fama.factors.alpha_lib import validate_alpha_syntax_strict
 from utils.factor_catalog import load_factor_name_set, resolve_base_factor_cache
 from utils.ric_engine import compute_rankic_from_files, resolve_ric_params
 from fama.selection.config import apply_selection_overrides, load_selection_config
+from utils.complexity import apply_complexity_gate
 from fama.selection.models import SelectionInput, empty_corr_df
 from fama.selection.pipeline import run_selection_pipeline
 from fama.selection.reporting import (
@@ -651,6 +652,34 @@ def main() -> None:
         expr_map = {f.name: f.expression for f in llm_fs.factors}
         expl_map = {f.name: f.explanation for f in llm_fs.factors}
         ref_map = {f.name: getattr(f, "references", None) for f in llm_fs.factors}
+
+        # 5) Complexity gate (only after RIC + correlation selection passed)
+        if selection_cfg.complexity_enabled:
+            print(
+                f"[workflow] Complexity gate | candidates={len(passed)} | "
+                f"max_ops={selection_cfg.complexity_max_ops} | max_depth={selection_cfg.complexity_max_depth}"
+            )
+            passed_after_complexity, dropped_complexity = apply_complexity_gate(
+                passed,
+                expr_map,
+                enabled=True,
+                max_ops=selection_cfg.complexity_max_ops,
+                max_depth=selection_cfg.complexity_max_depth,
+            )
+            if dropped_complexity:
+                print(f"[workflow] Dropped {len(dropped_complexity)} factors by complexity:")
+                for item in dropped_complexity:
+                    print(
+                        f"  - {item.factor} | ops={item.ops if item.ops is not None else 'N/A'} | "
+                        f"depth={item.depth if item.depth is not None else 'N/A'} | reason={item.reason}"
+                    )
+            passed = passed_after_complexity
+            print(f"[workflow] Complexity gate done | kept={len(passed)}")
+            if not passed:
+                print("[workflow] No factors passed complexity gate; continue to next iteration.")
+                print(f"[workflow] Iteration elapsed={time.perf_counter() - iter_started:.2f}s")
+                continue
+
         selected_exprs = {name: expr_map[name] for name in passed if name in expr_map}
         selected_expl = {name: expl_map.get(name) for name in passed if name in expl_map}
         selected_refs = {name: ref_map.get(name) for name in passed}

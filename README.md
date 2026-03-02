@@ -119,6 +119,7 @@ LLMQuant/
 - `selection.corr_threshold`：new-vs-base 最大允许相关性
 - `selection.llm_self_corr_threshold`：new-vs-old/new-vs-new 最大允许相关性
 - `selection.min_corr_obs`：相关性最小重叠样本
+- `selection.complexity.enabled / max_ops / max_depth`：复杂度过滤开关与阈值（在 RIC+相关性筛选后执行）
 
 兼容说明：
 - `workflow.ric_threshold / corr_threshold / llm_self_corr_threshold / min_corr_obs` 仍可作为回退键，但建议统一迁移到 `selection.*`。

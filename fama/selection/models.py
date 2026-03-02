@@ -25,6 +25,9 @@ class SelectionConfig:
     log_topk: int = 3
     scope_use_ric_assets: bool = True
     scope_use_ric_window: bool = True
+    complexity_enabled: bool = False
+    complexity_max_ops: int = 18
+    complexity_max_depth: int = 8
 
 
 @dataclass
@@ -66,4 +69,3 @@ class SelectionResult:
     elapsed_new_vs_old_llm: float = 0.0
     elapsed_new_vs_new_llm: float = 0.0
     elapsed_total: float = 0.0
-

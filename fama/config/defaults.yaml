@@ -42,6 +42,10 @@ selection:
   scope:
     use_ric_assets: true  # 相关性筛选是否沿用 ric.assets
     use_ric_window: true  # 相关性筛选是否沿用 ric.start_date/end_date
+  complexity:
+    enabled: true  # 是否启用表达式复杂度过滤（仅在 RIC+相关性通过后执行）
+    max_ops: 10  # 最大算子数量（Call + BinOp + UnaryOp）
+    max_depth: 3  # 最大嵌套层数（按算子节点深度计）
 base_catalog:
   selected_sources: ["alpha101", "alpha158"]  # 运行时基础因子源选择（可选: alpha101, alpha158）
   include_llm_library_in_base: true  # 是否将通过筛选的 LLM 正式库并入 base（true/false）

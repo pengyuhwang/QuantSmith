@@ -19,6 +19,7 @@ def load_selection_config(cfg: Mapping[str, Any] | None) -> SelectionConfig:
         return default
 
     scope_cfg = selection_cfg.get("scope", {}) if isinstance(selection_cfg.get("scope"), Mapping) else {}
+    complexity_cfg = selection_cfg.get("complexity", {}) if isinstance(selection_cfg.get("complexity"), Mapping) else {}
 
     config = SelectionConfig(
         ric_threshold=float(_pick("ric_threshold", "ric_threshold", 0.08)),
@@ -32,10 +33,17 @@ def load_selection_config(cfg: Mapping[str, Any] | None) -> SelectionConfig:
         log_topk=max(1, int(_pick("log_topk", None, 3))),
         scope_use_ric_assets=bool(scope_cfg.get("use_ric_assets", True)),
         scope_use_ric_window=bool(scope_cfg.get("use_ric_window", True)),
+        complexity_enabled=bool(complexity_cfg.get("enabled", False)),
+        complexity_max_ops=int(complexity_cfg.get("max_ops", 18)),
+        complexity_max_depth=int(complexity_cfg.get("max_depth", 8)),
     )
 
     if config.min_corr_obs <= 0:
         raise ValueError(f"selection.min_corr_obs must be positive, got {config.min_corr_obs}.")
+    if config.complexity_max_ops <= 0:
+        raise ValueError(f"selection.complexity.max_ops must be positive, got {config.complexity_max_ops}.")
+    if config.complexity_max_depth <= 0:
+        raise ValueError(f"selection.complexity.max_depth must be positive, got {config.complexity_max_depth}.")
     if config.dedup_strategy != "greedy_by_min_abs_ric":
         raise ValueError(
             f"Unsupported selection.dedup_strategy={config.dedup_strategy}; "
@@ -64,4 +72,3 @@ def apply_selection_overrides(
     if patched.min_corr_obs <= 0:
         raise ValueError(f"min_corr_obs must be positive, got {patched.min_corr_obs}.")
     return patched
-

@@ -30,14 +30,20 @@ def resolve_ric_params(
     cfg = cfg or {}
     ric_cfg = cfg.get("ric", {}) if isinstance(cfg, Mapping) else {}
     coe_cfg = cfg.get("coe", {}) if isinstance(cfg, Mapping) else {}
+    windows_cfg = cfg.get("windows", {}) if isinstance(cfg, Mapping) else {}
+    train_window_cfg = windows_cfg.get("train", {}) if isinstance(windows_cfg, Mapping) else {}
 
     resolved_assets: list[str] | None
     if assets is not None:
         resolved_assets = [str(item) for item in assets]
     else:
-        cfg_assets = ric_cfg.get("assets") if isinstance(ric_cfg, Mapping) else None
-        if not cfg_assets:
-            cfg_assets = coe_cfg.get("benchmark_assets") if isinstance(coe_cfg, Mapping) else None
+        cfg_assets = cfg.get("assets") if isinstance(cfg, Mapping) else None
+        if cfg_assets is None and isinstance(cfg, Mapping):
+            # Alias support: single asset key.
+            cfg_assets = cfg.get("asset")
+        if cfg_assets is None and isinstance(ric_cfg, Mapping):
+            # Legacy fallback for older configs.
+            cfg_assets = ric_cfg.get("assets")
         if isinstance(cfg_assets, str):
             cfg_assets = [cfg_assets]
         resolved_assets = [str(item) for item in cfg_assets] if cfg_assets else None
@@ -46,8 +52,16 @@ def resolve_ric_params(
     if resolved_min_obs <= 0:
         raise ValueError(f"min_obs must be positive, got {resolved_min_obs}.")
 
-    resolved_start = start_date if start_date is not None else ric_cfg.get("start_date") or coe_cfg.get("ric_start_date")
-    resolved_end = end_date if end_date is not None else ric_cfg.get("end_date") or coe_cfg.get("ric_end_date")
+    resolved_start = (
+        start_date
+        if start_date is not None
+        else train_window_cfg.get("start_date") or ric_cfg.get("start_date") or coe_cfg.get("ric_start_date")
+    )
+    resolved_end = (
+        end_date
+        if end_date is not None
+        else train_window_cfg.get("end_date") or ric_cfg.get("end_date") or coe_cfg.get("ric_end_date")
+    )
     return resolved_assets, resolved_min_obs, resolved_start, resolved_end
 
 

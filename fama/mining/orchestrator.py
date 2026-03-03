@@ -57,6 +57,7 @@ class PromptOrchestrator:
         self.cfg["paths"]["market_data"] = str(market_data_path)
         self.market_data = load_market_data(str(market_data_path))
         self.llm_cfg = cfg.get("llm", {})
+        self.css_cfg = cfg.get("css", {})
         self.coe_cfg = cfg.get("coe", {})
         deny_fields = {field.upper() for field in self.llm_cfg.get("deny_fields", [])}
         self.available_fields = available_factor_inputs(self.market_data)
@@ -91,8 +92,17 @@ class PromptOrchestrator:
         self.coe_manager.attach_logger(self.logger)
         self.forward_returns = self._compute_forward_returns(self.market_data)
         self.coe_manager.set_forward_returns(self.forward_returns)
-        benchmark_assets = self.coe_cfg.get("benchmark_assets") or []
-        self.coe_manager.benchmark_assets = benchmark_assets
+        global_assets, _, _, _ = resolve_ric_params(self.cfg)
+        self.global_assets = [str(asset) for asset in (global_assets or [])]
+        if not self.global_assets:
+            raise ValueError("未配置全局 assets，无法初始化指标资产范围。")
+        self.coe_ric_asset_mode = str(self.coe_cfg.get("ric_asset_mode", "global")).strip().lower()
+        self.coe_metric_assets = self._resolve_module_assets(
+            mode=self.coe_ric_asset_mode,
+            custom_assets=self.coe_cfg.get("ric_assets"),
+            module_name="coe.ric",
+        )
+        self.coe_manager.benchmark_assets = [str(asset) for asset in self.coe_metric_assets]
         max_depth = self.coe_cfg.get("max_depth")
         if max_depth is not None:
             self.coe_manager.max_depth = max_depth
@@ -109,12 +119,37 @@ class PromptOrchestrator:
         metrics_fields = self.coe_cfg.get("prompt_metrics")
         if metrics_fields is not None:
             self.coe_manager.prompt_metrics = [str(f).lower() for f in metrics_fields]
-        ric_start = self.coe_cfg.get("ric_start_date")
-        ric_end = self.coe_cfg.get("ric_end_date")
-        if ric_start:
-            self.coe_manager.ric_start = pd.to_datetime(ric_start)
-        if ric_end:
-            self.coe_manager.ric_end = pd.to_datetime(ric_end)
+
+        self.css_cluster_start, self.css_cluster_end = self._resolve_module_window(
+            mode=self.css_cfg.get("cluster_window_mode", "train"),
+            custom_start=self.css_cfg.get("cluster_start_date"),
+            custom_end=self.css_cfg.get("cluster_end_date"),
+            module_name="css.cluster",
+        )
+        coe_ric_mode = self.coe_cfg.get("ric_window_mode")
+        if coe_ric_mode is None:
+            # Backward compatible behavior:
+            # explicit coe.ric_start_date / coe.ric_end_date => custom, else train
+            coe_ric_mode = "custom" if (self.coe_cfg.get("ric_start_date") or self.coe_cfg.get("ric_end_date")) else "train"
+        self.coe_ric_start, self.coe_ric_end = self._resolve_module_window(
+            mode=coe_ric_mode,
+            custom_start=self.coe_cfg.get("ric_start_date"),
+            custom_end=self.coe_cfg.get("ric_end_date"),
+            module_name="coe.ric",
+        )
+        if self.coe_ric_start:
+            self.coe_manager.ric_start = pd.to_datetime(self.coe_ric_start)
+        if self.coe_ric_end:
+            self.coe_manager.ric_end = pd.to_datetime(self.coe_ric_end)
+        self.logger.info(
+            "Window policy | css.cluster=%s->%s | coe.ric=%s->%s | coe.assets(mode=%s)=%s",
+            self.css_cluster_start or "unbounded",
+            self.css_cluster_end or "unbounded",
+            self.coe_ric_start or "unbounded",
+            self.coe_ric_end or "unbounded",
+            self.coe_ric_asset_mode,
+            ",".join(self.coe_metric_assets),
+        )
         metrics_dir_cfg = self.cfg["paths"].get("factor_metrics_dir")
         default_metrics = self.project_root / "factor_value_prepared" / "data" / "factors"
         self.factor_metrics_dir = self._resolve_project_path(Path(metrics_dir_cfg)) if metrics_dir_cfg else default_metrics
@@ -150,7 +185,13 @@ class PromptOrchestrator:
         if not factors.factors or self.factor_frame.empty:
             return [], []
 
-        matrix = self.factor_frame.to_numpy(dtype=float)
+        cluster_frame = self._slice_factor_frame_by_window(
+            self.factor_frame,
+            start_date=self.css_cluster_start,
+            end_date=self.css_cluster_end,
+            stage_name="CSS cluster",
+        )
+        matrix = cluster_frame.to_numpy(dtype=float)
         clusters, centers, norm_matrix = cluster_factors_kmeans(matrix, self.cfg.get("k", 8))
         if not clusters:
             self.logger.warning("CSS clustering produced no clusters; falling back to sequential order.")
@@ -179,7 +220,7 @@ class PromptOrchestrator:
         self.logger.info("CSS selected factor indices: %s", selections)
         if clusters:
             self._execute_factor_metrics_scripts()
-            self.coe_manager.rebuild_from_clusters(self.factor_set, self.factor_frame, clusters)
+            self.coe_manager.rebuild_from_clusters(self.factor_set, cluster_frame, clusters)
         css_examples: list[str] = []
         css_names: list[str] = []
         selected_pairs: list[str] = []
@@ -220,11 +261,17 @@ class PromptOrchestrator:
         """根据 README “CoE Context Assembly” 章节构造经验链。"""
 
         if not self.coe_manager.chains:
-            matrix = self.factor_frame.to_numpy(dtype=float)
+            cluster_frame = self._slice_factor_frame_by_window(
+                self.factor_frame,
+                start_date=self.css_cluster_start,
+                end_date=self.css_cluster_end,
+                stage_name="CoE cluster bootstrap",
+            )
+            matrix = cluster_frame.to_numpy(dtype=float)
             clusters, _, _ = cluster_factors_kmeans(matrix, self.cfg.get("k", 8))
             if clusters:
                 self._execute_factor_metrics_scripts()
-                self.coe_manager.rebuild_from_clusters(self.factor_set, self.factor_frame, clusters)
+                self.coe_manager.rebuild_from_clusters(self.factor_set, cluster_frame, clusters)
 
         coe_lines = self.coe_manager.format_top_chains()
         coe_names = self.coe_manager.top_chain_factor_names()
@@ -302,6 +349,97 @@ class PromptOrchestrator:
         if path.is_absolute():
             return path
         return (self.project_root / path).resolve()
+
+    def _resolve_module_window(
+        self,
+        *,
+        mode: str | None,
+        custom_start: str | None,
+        custom_end: str | None,
+        module_name: str,
+    ) -> tuple[str | None, str | None]:
+        mode_text = str(mode or "train").strip().lower()
+        windows_cfg = self.cfg.get("windows", {}) if isinstance(self.cfg.get("windows"), dict) else {}
+        train_cfg = windows_cfg.get("train", {}) if isinstance(windows_cfg.get("train"), dict) else {}
+        valid_cfg = windows_cfg.get("valid", {}) if isinstance(windows_cfg.get("valid"), dict) else {}
+
+        def _clean(value: str | None) -> str | None:
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+
+        if mode_text == "train":
+            start_date = _clean(train_cfg.get("start_date"))
+            end_date = _clean(train_cfg.get("end_date"))
+        elif mode_text == "valid":
+            start_date = _clean(valid_cfg.get("start_date"))
+            end_date = _clean(valid_cfg.get("end_date"))
+        elif mode_text == "full":
+            start_date = None
+            end_date = None
+        elif mode_text == "custom":
+            start_date = _clean(custom_start)
+            end_date = _clean(custom_end)
+            if not start_date and not end_date:
+                raise ValueError(
+                    f"{module_name}.window_mode=custom 时，至少设置一个边界 "
+                    f"({module_name}.start_date / {module_name}.end_date)。"
+                )
+        else:
+            self.logger.warning("Unknown %s.window_mode=%s; fallback to train.", module_name, mode_text)
+            start_date = _clean(train_cfg.get("start_date"))
+            end_date = _clean(train_cfg.get("end_date"))
+        return start_date, end_date
+
+    def _resolve_module_assets(
+        self,
+        *,
+        mode: str | None,
+        custom_assets,
+        module_name: str,
+    ) -> list[str]:
+        mode_text = str(mode or "global").strip().lower()
+        if mode_text == "global":
+            assets = [str(item) for item in self.global_assets]
+        elif mode_text == "custom":
+            if isinstance(custom_assets, str):
+                custom_assets = [custom_assets]
+            if not isinstance(custom_assets, (list, tuple, set)):
+                custom_assets = []
+            assets = [str(item).strip() for item in custom_assets if str(item).strip()]
+        else:
+            raise ValueError(f"{module_name}.asset_mode 仅支持 global/custom，当前={mode_text!r}。")
+        if not assets:
+            raise ValueError(f"{module_name} 资产列表为空，请检查 {module_name}_asset_mode / {module_name}_assets 配置。")
+        return assets
+
+    def _slice_factor_frame_by_window(
+        self,
+        frame: pd.DataFrame,
+        *,
+        start_date: str | None,
+        end_date: str | None,
+        stage_name: str,
+    ) -> pd.DataFrame:
+        if frame.empty or (not start_date and not end_date):
+            return frame
+        date_index = pd.to_datetime(frame.index.get_level_values("date"), errors="coerce")
+        mask = np.ones(len(frame), dtype=bool)
+        if start_date:
+            mask &= date_index >= pd.to_datetime(start_date)
+        if end_date:
+            mask &= date_index <= pd.to_datetime(end_date)
+        scoped = frame.loc[mask]
+        if scoped.empty:
+            self.logger.warning(
+                "%s window %s -> %s 无可用样本，回退全量区间。",
+                stage_name,
+                start_date or "unbounded",
+                end_date or "unbounded",
+            )
+            return frame
+        return scoped
 
     def _resolve_factor_base_parquet_path(self) -> Path:
         raw = self.cfg["paths"].get("factor_base_parquet", "./factor_value_prepared/data/factors/dsl_factors_new.parquet")
@@ -392,7 +530,12 @@ class PromptOrchestrator:
                 self.logger.warning("未找到基础因子值文件，将先执行一次计算：%s", self.factor_base_parquet_path)
                 self.factor_frame = self._ensure_and_load_base_factor_frame()
             market_data_path = self._resolve_project_path(Path(self.cfg["paths"]["market_data"]))
-            ric_assets, min_obs, ric_start, ric_end = resolve_ric_params(self.cfg)
+            ric_assets, min_obs, ric_start, ric_end = resolve_ric_params(
+                self.cfg,
+                assets=self.coe_metric_assets,
+                start_date=self.coe_ric_start,
+                end_date=self.coe_ric_end,
+            )
             self.logger.info(
                 "调用 utils.ric_engine.compute_rankic_from_files | factor=%s | price=%s | output=%s",
                 self.factor_base_parquet_path,
@@ -418,7 +561,6 @@ class PromptOrchestrator:
                 include_ic=True,
                 include_icir=True,
                 config_path=self.cfg.get("_config_path"),
-                calendar_anchor_symbol=self.cfg.get("backtest", {}).get("calendar_anchor_symbol"),
             )
             self.logger.info("RIC 计算完成 | elapsed=%.2fs", time.perf_counter() - started)
         except Exception:

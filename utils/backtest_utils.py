@@ -15,17 +15,45 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "fama" / "config" / "defaults.yaml"
 
 
 def _load_calendar_anchor_symbol_from_config(config_path=None):
-    """Load backtest calendar anchor symbol from config."""
+    """Load calendar anchor symbol from config.
+
+    Priority:
+    1) top-level assets first symbol (project-wide unified asset setting)
+    2) backtest.calendar_anchor_symbol (legacy fallback)
+    3) ric.assets first symbol (legacy fallback for old configs)
+    """
     path = Path(config_path).expanduser() if config_path else DEFAULT_CONFIG_PATH
     try:
         payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
         return None
+    assets = payload.get("assets") if isinstance(payload, dict) else None
+    if assets is None and isinstance(payload, dict):
+        assets = payload.get("asset")
+    if isinstance(assets, (list, tuple)):
+        for item in assets:
+            text = str(item).strip()
+            if text:
+                return text
+    elif isinstance(assets, str) and assets.strip():
+        return assets.strip()
+
     backtest_cfg = payload.get("backtest") if isinstance(payload, dict) else None
     if isinstance(backtest_cfg, dict):
         symbol = backtest_cfg.get("calendar_anchor_symbol")
         if isinstance(symbol, str) and symbol.strip():
             return symbol.strip()
+    # Legacy fallback: old config layout where assets lived under ric.assets
+    ric_cfg = payload.get("ric") if isinstance(payload, dict) else None
+    if isinstance(ric_cfg, dict):
+        assets = ric_cfg.get("assets")
+        if isinstance(assets, (list, tuple)):
+            for item in assets:
+                text = str(item).strip()
+                if text:
+                    return text
+        elif isinstance(assets, str) and assets.strip():
+            return assets.strip()
     return None
 
 

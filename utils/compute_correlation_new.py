@@ -8,10 +8,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 
 
 def parse_args() -> argparse.Namespace:
@@ -176,6 +174,9 @@ def plot_heatmap(
     output_path: Path,
     topk_base: int,
 ) -> None:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
     if corr_df.empty:
         print("No correlation pairs to plot.")
         return

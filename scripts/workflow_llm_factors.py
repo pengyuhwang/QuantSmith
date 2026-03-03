@@ -20,14 +20,12 @@ from fama.factors.alpha_lib import validate_alpha_syntax_strict
 from utils.factor_catalog import load_factor_name_set, resolve_base_factor_cache
 from utils.ric_engine import compute_rankic_from_files, resolve_ric_params
 from fama.selection.config import apply_selection_overrides, load_selection_config
-from utils.complexity import apply_complexity_gate
-from fama.selection.models import SelectionInput, empty_corr_df
+from fama.memory import append_memory_csv, build_memory_records
+from fama.selection.models import SelectionInput
 from fama.selection.pipeline import run_selection_pipeline
 from fama.selection.reporting import (
     apply_corr_scope,
     corr_input_summary,
-    format_ric_passed_details,
-    top_self_corr,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +42,73 @@ def _pick_path(arg_value: str | Path | None, cfg_value: str | None, fallback: Pa
     if raw is None:
         return fallback
     return Path(raw).expanduser()
+
+
+def _resolve_train_valid_windows(
+    cfg: dict,
+    *,
+    train_start_override: str | None = None,
+    train_end_override: str | None = None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    windows_cfg = cfg.get("windows", {}) if isinstance(cfg.get("windows"), dict) else {}
+    train_cfg = windows_cfg.get("train", {}) if isinstance(windows_cfg.get("train"), dict) else {}
+    valid_cfg = windows_cfg.get("valid", {}) if isinstance(windows_cfg.get("valid"), dict) else {}
+
+    ric_cfg = cfg.get("ric", {}) if isinstance(cfg.get("ric"), dict) else {}
+    coe_cfg = cfg.get("coe", {}) if isinstance(cfg.get("coe"), dict) else {}
+
+    train_start = (
+        train_start_override
+        if train_start_override is not None
+        else train_cfg.get("start_date") or ric_cfg.get("start_date") or coe_cfg.get("ric_start_date")
+    )
+    train_end = (
+        train_end_override
+        if train_end_override is not None
+        else train_cfg.get("end_date") or ric_cfg.get("end_date") or coe_cfg.get("ric_end_date")
+    )
+    valid_start = valid_cfg.get("start_date")
+    valid_end = valid_cfg.get("end_date")
+    return train_start, train_end, valid_start, valid_end
+
+
+def _resolve_selection_scope_window(
+    *,
+    mode: str,
+    train_start: str | None,
+    train_end: str | None,
+    valid_start: str | None,
+    valid_end: str | None,
+    custom_start: str | None,
+    custom_end: str | None,
+    scope_name: str,
+) -> tuple[str | None, str | None, str]:
+    mode_text = str(mode).strip().lower()
+    if mode_text == "train":
+        return train_start, train_end, "windows.train"
+    if mode_text == "valid":
+        return valid_start, valid_end, "windows.valid"
+    if mode_text == "full":
+        return None, None, "full"
+    if mode_text == "custom":
+        return custom_start, custom_end, f"{scope_name}.start/end"
+    raise ValueError(f"Unsupported {scope_name} mode: {mode_text}")
+
+
+def _factor_to_meta(item: Factor) -> dict[str, object]:
+    return {
+        "expression": item.expression,
+        "explanation": item.explanation,
+        "references": item.references or [],
+    }
+
+
+def _load_factor_meta(path: Path) -> dict[str, dict[str, object]]:
+    try:
+        fs = deserialize_factor_set(str(path))
+    except Exception:
+        fs = FactorSet([])
+    return {f.name: _factor_to_meta(f) for f in fs.factors if isinstance(getattr(f, "name", None), str)}
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,25 +128,25 @@ def parse_args() -> argparse.Namespace:
         "--ric-threshold",
         type=float,
         default=None,
-        help="RIC threshold per asset. Omit to follow cfg.selection.ric_threshold (fallback cfg.workflow.ric_threshold).",
+        help="Train min-abs-RIC threshold. Omit to follow cfg.selection.criteria.train_min_abs_ric.threshold.",
     )
     parser.add_argument(
         "--corr-threshold",
         type=float,
         default=None,
-        help="Max absolute correlation vs base factors. Omit to follow cfg.selection.corr_threshold (fallback cfg.workflow.corr_threshold).",
+        help="Train max-abs-corr threshold vs base. Omit to follow cfg.selection.criteria.train_max_abs_corr_base.threshold.",
     )
     parser.add_argument(
         "--llm-self-corr-threshold",
         type=float,
         default=None,
-        help="Max absolute correlation for new-vs-old and new-vs-new LLM filtering. Omit to follow cfg.selection.llm_self_corr_threshold (fallback cfg.workflow.llm_self_corr_threshold).",
+        help="Train max-abs-corr threshold for new-vs-old/new-vs-new LLM. Omit to follow cfg.selection.criteria.*.",
     )
     parser.add_argument(
         "--assets",
         nargs="+",
         default=None,
-        help="Asset ids to enforce RIC threshold on. Omit to follow cfg.ric.assets (or cfg.coe.benchmark_assets).",
+        help="Asset ids to enforce RIC threshold on. Omit to follow cfg.assets.",
     )
     parser.add_argument(
         "--min-ric-obs",
@@ -93,7 +158,7 @@ def parse_args() -> argparse.Namespace:
         "--min-corr-obs",
         type=int,
         default=None,
-        help="Minimum overlapping obs for correlation. Omit to follow cfg.selection.min_corr_obs (fallback cfg.workflow.min_corr_obs).",
+        help="Minimum overlapping obs for correlation. Omit to follow cfg.selection.min_corr_obs.",
     )
     parser.add_argument(
         "--llm-output",
@@ -138,12 +203,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ric-start",
         default=None,
-        help="Optional start date for RIC calculation (YYYY-MM-DD). Omit to follow cfg.ric.start_date/cfg.coe.ric_start_date.",
+        help="Optional train-window start date (YYYY-MM-DD). Omit to follow cfg.windows.train.start_date.",
     )
     parser.add_argument(
         "--ric-end",
         default=None,
-        help="Optional end date for RIC calculation (YYYY-MM-DD). Omit to follow cfg.ric.end_date/cfg.coe.ric_end_date.",
+        help="Optional train-window end date (YYYY-MM-DD). Omit to follow cfg.windows.train.end_date.",
     )
     return parser.parse_args()
 
@@ -186,9 +251,14 @@ def main() -> None:
         llm_self_corr_threshold=args.llm_self_corr_threshold,
         min_corr_obs=args.min_corr_obs,
     )
-    args.ric_threshold = float(selection_cfg.ric_threshold)
-    args.corr_threshold = float(selection_cfg.corr_threshold)
-    args.llm_self_corr_threshold = float(selection_cfg.llm_self_corr_threshold)
+    args.ric_threshold = float(selection_cfg.train_min_abs_ric_threshold)
+    args.corr_threshold = float(selection_cfg.train_max_abs_corr_base_threshold)
+    args.llm_self_corr_threshold = float(
+        max(
+            selection_cfg.train_max_abs_corr_old_llm_threshold,
+            selection_cfg.train_max_abs_corr_new_llm_threshold,
+        )
+    )
     args.min_corr_obs = int(selection_cfg.min_corr_obs)
 
     if args.iterations <= 0:
@@ -213,6 +283,11 @@ def main() -> None:
         paths.get("factor_ric_llm"),
         PROJECT_ROOT / "tmp" / "llm_factor_ric.csv",
     )
+    ric_valid_output_path = _pick_path(
+        None,
+        paths.get("factor_ric_llm_valid"),
+        PROJECT_ROOT / "tmp" / "llm_factor_ric_valid.csv",
+    )
     corr_output_new_vs_base_path = _pick_path(
         args.corr_output,
         paths.get("corr_output_new_vs_base") or paths.get("corr_output"),
@@ -228,10 +303,35 @@ def main() -> None:
         paths.get("corr_output_new_vs_new_llm"),
         PROJECT_ROOT / "tmp" / "new_llm_vs_new_llm_corr.csv",
     )
+    corr_output_valid_new_vs_base_path = _pick_path(
+        None,
+        paths.get("corr_output_valid_new_vs_base"),
+        PROJECT_ROOT / "tmp" / "new_llm_vs_base_corr_valid.csv",
+    )
+    corr_output_valid_new_vs_old_llm_path = _pick_path(
+        None,
+        paths.get("corr_output_valid_new_vs_old_llm"),
+        PROJECT_ROOT / "tmp" / "new_llm_vs_old_llm_corr_valid.csv",
+    )
+    corr_output_valid_new_vs_new_llm_path = _pick_path(
+        None,
+        paths.get("corr_output_valid_new_vs_new_llm"),
+        PROJECT_ROOT / "tmp" / "new_llm_vs_new_llm_corr_valid.csv",
+    )
     llm_factor_library_path = _pick_path(
         None,
         paths.get("llm_factor_library"),
         PROJECT_ROOT / "data" / "factor_cache_new" / "LLM_library.yaml",
+    )
+    success_cases_path = _pick_path(
+        None,
+        paths.get("factor_success_cases"),
+        PROJECT_ROOT / "tmp" / "factor_success_cases.csv",
+    )
+    failure_cases_path = _pick_path(
+        None,
+        paths.get("factor_failure_cases"),
+        PROJECT_ROOT / "tmp" / "factor_failure_cases.csv",
     )
     if price_path is None:
         raise ValueError("无法确定 market_data 路径，请设置 cfg.paths.market_data 或传入 --price-path。")
@@ -241,6 +341,8 @@ def main() -> None:
         raise ValueError("无法确定 base_factor_dir 路径，请设置 cfg.paths.base_factor_dir 或传入 --base-factor-dir。")
     if ric_output_path is None:
         raise ValueError("无法确定 LLM RIC 路径，请设置 cfg.paths.factor_ric_llm 或传入 --ric-output。")
+    if ric_valid_output_path is None:
+        raise ValueError("无法确定 LLM 验证集 RIC 路径，请设置 cfg.paths.factor_ric_llm_valid。")
     if corr_output_new_vs_base_path is None:
         raise ValueError("无法确定 new-vs-base 相关性路径，请设置 cfg.paths.corr_output_new_vs_base 或传入 --corr-output。")
     if corr_output_new_vs_old_llm_path is None:
@@ -253,21 +355,32 @@ def main() -> None:
         )
     if llm_factor_library_path is None:
         raise ValueError("无法确定 LLM 正式入库路径，请设置 cfg.paths.llm_factor_library。")
+    if success_cases_path is None:
+        raise ValueError("无法确定 success cases 路径，请设置 cfg.paths.factor_success_cases。")
+    if failure_cases_path is None:
+        raise ValueError("无法确定 failure cases 路径，请设置 cfg.paths.factor_failure_cases。")
 
     price_path = str(price_path.resolve())
     llm_factor_parquet_path = llm_factor_parquet_path.resolve()
     base_factor_dir = base_factor_dir.resolve()
     ric_output_path = ric_output_path.resolve()
+    ric_valid_output_path = ric_valid_output_path.resolve()
     corr_output_new_vs_base_path = corr_output_new_vs_base_path.resolve()
     corr_output_new_vs_old_llm_path = corr_output_new_vs_old_llm_path.resolve()
     corr_output_new_vs_new_llm_path = corr_output_new_vs_new_llm_path.resolve()
+    corr_output_valid_new_vs_base_path = corr_output_valid_new_vs_base_path.resolve()
+    corr_output_valid_new_vs_old_llm_path = corr_output_valid_new_vs_old_llm_path.resolve()
+    corr_output_valid_new_vs_new_llm_path = corr_output_valid_new_vs_new_llm_path.resolve()
     llm_factor_library_path = llm_factor_library_path.resolve()
+    success_cases_path = success_cases_path.resolve()
+    failure_cases_path = failure_cases_path.resolve()
     llm_output_path = llm_output_path.resolve() if llm_output_path is not None else None
     cfg["paths"]["market_data"] = price_path
     cfg["paths"]["llm_factor_library"] = str(llm_factor_library_path)
 
     base_resolved_path, base_sources = resolve_base_factor_cache(cfg)
     base_factor_name_set = load_factor_name_set(base_resolved_path)
+    base_meta_map = _load_factor_meta(Path(base_resolved_path))
 
     # Resolve market data and assert amount exists
     md_path = price_path
@@ -277,27 +390,81 @@ def main() -> None:
     print(f"[workflow] Available fields: {avail}")
     if "AMOUNT" not in avail:
         raise RuntimeError("Market data missing AMOUNT; cannot evaluate AMOUNT-dependent factors.")
-    ric_assets, min_ric_obs, ric_start, ric_end = resolve_ric_params(
+    global_assets, min_ric_obs, _, _ = resolve_ric_params(
         cfg,
         assets=args.assets,
         min_obs=args.min_ric_obs,
-        start_date=args.ric_start,
-        end_date=args.ric_end,
+        start_date=None,
+        end_date=None,
     )
-    if not ric_assets:
-        raise ValueError("无法确定 RIC 资产列表，请设置 --assets 或 cfg.ric.assets/cfg.coe.benchmark_assets。")
-    print(f"[workflow] RIC window: {ric_start or 'unbounded'} → {ric_end or 'unbounded'} (fallback to ric/coe config)")
+    if selection_cfg.scope_asset_mode == "global":
+        selection_metric_assets = [str(asset) for asset in (global_assets or [])]
+    elif selection_cfg.scope_asset_mode == "custom":
+        selection_metric_assets = [str(asset) for asset in selection_cfg.scope_assets]
+    else:
+        raise ValueError(f"Unsupported selection asset mode: {selection_cfg.scope_asset_mode}")
+
+    train_start, train_end, valid_start, valid_end = _resolve_train_valid_windows(
+        cfg,
+        train_start_override=args.ric_start,
+        train_end_override=args.ric_end,
+    )
+    corr_train_start, corr_train_end, train_scope_source = _resolve_selection_scope_window(
+        mode=selection_cfg.scope_train_window_mode,
+        train_start=train_start,
+        train_end=train_end,
+        valid_start=valid_start,
+        valid_end=valid_end,
+        custom_start=selection_cfg.scope_train_start_date,
+        custom_end=selection_cfg.scope_train_end_date,
+        scope_name="selection.scope.train",
+    )
+    corr_valid_start, corr_valid_end, valid_scope_source = _resolve_selection_scope_window(
+        mode=selection_cfg.scope_valid_window_mode,
+        train_start=train_start,
+        train_end=train_end,
+        valid_start=valid_start,
+        valid_end=valid_end,
+        custom_start=selection_cfg.scope_valid_start_date,
+        custom_end=selection_cfg.scope_valid_end_date,
+        scope_name="selection.scope.valid",
+    )
+    if not global_assets:
+        raise ValueError("无法确定全局资产列表，请设置 --assets 或 cfg.assets。")
+    if not selection_metric_assets:
+        raise ValueError("selection 指标资产为空，请检查 selection.scope.asset_mode / selection.scope.assets。")
+    print(
+        f"[workflow] Train window: {train_start or 'unbounded'} → {train_end or 'unbounded'} | "
+        f"Valid window: {valid_start or 'unbounded'} → {valid_end or 'unbounded'}"
+    )
     print(
         "[workflow] Runtime params | "
-        f"ric_assets={','.join(ric_assets)} | min_ric_obs={min_ric_obs} | "
-        f"ric_threshold={args.ric_threshold} | corr_threshold={args.corr_threshold} | "
-        f"llm_self_corr_threshold={args.llm_self_corr_threshold} | min_corr_obs={args.min_corr_obs}"
+        f"global_assets={','.join(global_assets)} | "
+        f"selection_assets(mode={selection_cfg.scope_asset_mode})={','.join(selection_metric_assets)} | "
+        f"min_ric_obs={min_ric_obs} | "
+        f"train_min_abs_ric={selection_cfg.train_min_abs_ric_threshold} | "
+        f"train_max_corr_base={selection_cfg.train_max_abs_corr_base_threshold} | "
+        f"min_corr_obs={args.min_corr_obs}"
     )
     print(
-        "[workflow] Selection switches | "
-        f"new_vs_old_llm={selection_cfg.enable_new_vs_old_llm} | "
-        f"new_vs_new_llm={selection_cfg.enable_new_vs_new_llm} | "
-        f"require_full_asset_coverage={selection_cfg.require_full_asset_coverage}"
+        "[workflow] Criteria enabled | "
+        f"train_ric={selection_cfg.train_min_abs_ric_enabled} | "
+        f"train_corr_base={selection_cfg.train_max_abs_corr_base_enabled} | "
+        f"train_corr_old={selection_cfg.train_max_abs_corr_old_llm_enabled} | "
+        f"train_corr_new={selection_cfg.train_max_abs_corr_new_llm_enabled} | "
+        f"valid_ric={selection_cfg.valid_min_abs_ric_enabled} | "
+        f"valid_corr_base={selection_cfg.valid_max_abs_corr_base_enabled} | "
+        f"valid_corr_old={selection_cfg.valid_max_abs_corr_old_llm_enabled} | "
+        f"valid_corr_new={selection_cfg.valid_max_abs_corr_new_llm_enabled} | "
+        f"max_ops={selection_cfg.max_operator_count_enabled}:{selection_cfg.max_operator_count_threshold} | "
+        f"max_depth={selection_cfg.max_nesting_depth_enabled}:{selection_cfg.max_nesting_depth_threshold}"
+    )
+    print(
+        "[workflow] Corr scope source | "
+        f"train(mode={selection_cfg.scope_train_window_mode})={train_scope_source}:"
+        f"{corr_train_start or 'unbounded'}->{corr_train_end or 'unbounded'} | "
+        f"valid(mode={selection_cfg.scope_valid_window_mode})={valid_scope_source}:"
+        f"{corr_valid_start or 'unbounded'}->{corr_valid_end or 'unbounded'}"
     )
     print(
         "[workflow] Base catalog | "
@@ -430,35 +597,23 @@ def main() -> None:
             f"{calc_end.date() if pd.notna(calc_end) else 'N/A'}"
         )
 
-        # 3) RankIC
-        print(
-            f"[workflow] Call compute_rankic_from_files | factor={llm_parquet} | output={ric_output_path} | "
-            f"assets={','.join(ric_assets)} | min_obs={min_ric_obs} | "
-            f"window={ric_start or 'unbounded'}->{ric_end or 'unbounded'}"
-        )
-        stage_started = time.perf_counter()
-        ric_df = compute_rankic_from_files(
-            factor_path=Path(llm_parquet),
-            price_path=price_path,
-            output_path=ric_output_path,
-            assets=ric_assets,
-            min_obs=min_ric_obs,
-            start_date=ric_start,
-            end_date=ric_end,
-            include_ic=True,
-            include_icir=True,
-            config_path=cfg.get("_config_path"),
-            calendar_anchor_symbol=cfg.get("backtest", {}).get("calendar_anchor_symbol"),
-        )
-        print(f"[workflow] compute_rankic_from_files finished | elapsed={time.perf_counter() - stage_started:.2f}s")
-
-        # 4) Selection pipeline: RIC gate + new-vs-base + new-vs-old-llm + new-vs-new-llm
         new_factor_names = {f.name for f in new_factors}
-        ric_df = ric_df[ric_df["factor_tag"].isin(new_factor_names)]
-        if ric_df.empty:
-            print("[workflow] RIC 表中不存在本轮新因子，跳过本轮。")
+        computed_factor_names = {
+            str(name)
+            for name in llm_df_check["factor_tag"].dropna().astype(str).unique().tolist()
+        }
+        dropped_not_computable = sorted(new_factor_names - computed_factor_names)
+        if dropped_not_computable:
+            print(
+                f"[workflow] Dropped {len(dropped_not_computable)} factors: no computable values | "
+                f"{', '.join(dropped_not_computable)}"
+            )
+        new_factors = [f for f in new_factors if f.name in computed_factor_names]
+        if not new_factors:
+            print("[workflow] 本轮新因子均不可计算，跳过。")
             print(f"[workflow] Iteration elapsed={time.perf_counter() - iter_started:.2f}s")
             continue
+        new_factor_names = {f.name for f in new_factors}
 
         llm_df = load_llm_factors(Path(llm_parquet))
         llm_df = llm_df[llm_df["factor_tag"].isin(new_factor_names)]
@@ -467,28 +622,79 @@ def main() -> None:
             print(f"[workflow] Iteration elapsed={time.perf_counter() - iter_started:.2f}s")
             continue
 
+        # 3) RankIC (train + valid)
+        print(
+            f"[workflow] Call compute_rankic_from_files(train) | factor={llm_parquet} | output={ric_output_path} | "
+            f"assets={','.join(selection_metric_assets)} | min_obs={min_ric_obs} | "
+            f"window={train_start or 'unbounded'}->{train_end or 'unbounded'}"
+        )
+        stage_started = time.perf_counter()
+        train_ric_df = compute_rankic_from_files(
+            factor_path=Path(llm_parquet),
+            price_path=price_path,
+            output_path=ric_output_path,
+            assets=selection_metric_assets,
+            min_obs=min_ric_obs,
+            start_date=train_start,
+            end_date=train_end,
+            include_ic=True,
+            include_icir=True,
+            config_path=cfg.get("_config_path"),
+        )
+        print(f"[workflow] compute_rankic_from_files(train) finished | elapsed={time.perf_counter() - stage_started:.2f}s")
+        train_ric_df = train_ric_df[train_ric_df["factor_tag"].isin(new_factor_names)]
+
+        print(
+            f"[workflow] Call compute_rankic_from_files(valid) | factor={llm_parquet} | output={ric_valid_output_path} | "
+            f"assets={','.join(selection_metric_assets)} | min_obs={min_ric_obs} | "
+            f"window={valid_start or 'unbounded'}->{valid_end or 'unbounded'}"
+        )
+        stage_started = time.perf_counter()
+        valid_ric_df = compute_rankic_from_files(
+            factor_path=Path(llm_parquet),
+            price_path=price_path,
+            output_path=ric_valid_output_path,
+            assets=selection_metric_assets,
+            min_obs=min_ric_obs,
+            start_date=valid_start,
+            end_date=valid_end,
+            include_ic=True,
+            include_icir=True,
+            config_path=cfg.get("_config_path"),
+        )
+        print(f"[workflow] compute_rankic_from_files(valid) finished | elapsed={time.perf_counter() - stage_started:.2f}s")
+        valid_ric_df = valid_ric_df[valid_ric_df["factor_tag"].isin(new_factor_names)]
+
+        # 4) Prepare reference factor values
         base_df = load_base_factors(base_factor_dir)
-        # base_df = base_df[base_df["factor_tag"].isin(base_factor_name_set)]
         if base_df.empty:
             raise RuntimeError(
-                f"base_factor_dir 中未找到选定 base 因子，请检查 base 源与目录是否一致: {base_factor_dir}"
+                f"base_factor_dir 中未找到 base 因子，请检查目录内容: {base_factor_dir}"
             )
 
-        llm_df_scope = apply_corr_scope(llm_df, ric_assets, ric_start, ric_end)
-        base_df_scope = apply_corr_scope(base_df, ric_assets, ric_start, ric_end)
+        train_llm_scope = apply_corr_scope(llm_df, selection_metric_assets, corr_train_start, corr_train_end)
+        train_base_scope = apply_corr_scope(base_df, selection_metric_assets, corr_train_start, corr_train_end)
+        valid_llm_scope = apply_corr_scope(llm_df, selection_metric_assets, corr_valid_start, corr_valid_end)
+        valid_base_scope = apply_corr_scope(base_df, selection_metric_assets, corr_valid_start, corr_valid_end)
         print(
-            f"[workflow] Corr[new_vs_base] scope | assets={','.join(ric_assets)} | "
-            f"window={ric_start or 'unbounded'}->{ric_end or 'unbounded'} | min_obs={args.min_corr_obs}"
+            f"[workflow] Corr scope(train) | assets={','.join(selection_metric_assets)} | "
+            f"window={corr_train_start or 'unbounded'}->{corr_train_end or 'unbounded'} | min_obs={args.min_corr_obs}"
         )
-        print(f"[workflow] Corr[new_vs_base] {corr_input_summary(llm_df_scope, label='new(iteration_raw)')}")
-        print(f"[workflow] Corr[new_vs_base] {corr_input_summary(base_df_scope, label='base(reference_dir)')}")
+        print(f"[workflow] Corr input(train.new): {corr_input_summary(train_llm_scope, label='new')}")
+        print(f"[workflow] Corr input(train.base): {corr_input_summary(train_base_scope, label='base')}")
+        print(
+            f"[workflow] Corr scope(valid) | assets={','.join(selection_metric_assets)} | "
+            f"window={corr_valid_start or 'unbounded'}->{corr_valid_end or 'unbounded'} | min_obs={args.min_corr_obs}"
+        )
+        print(f"[workflow] Corr input(valid.new): {corr_input_summary(valid_llm_scope, label='new')}")
+        print(f"[workflow] Corr input(valid.base): {corr_input_summary(valid_base_scope, label='base')}")
 
         factor_cache_path = llm_factor_library_path
         try:
             factor_cache_fs = deserialize_factor_set(str(factor_cache_path))
         except Exception:
             factor_cache_fs = FactorSet([])
-        historical_llm = [f for f in factor_cache_fs.factors if "LLM" in f.name.upper()]
+        historical_llm = [f for f in factor_cache_fs.factors if "LLM" in f.name.upper() and f.name not in new_factor_names]
 
         old_llm_loader = None
         if historical_llm:
@@ -501,28 +707,37 @@ def main() -> None:
                     factor_cache_path=existing_cache_path,
                     **LLM_DSL_COLLECTION_KWARGS,
                 )
-                print("[workflow] Prepare historical LLM factor values for new-vs-old-llm correlation...")
+                print("[workflow] Prepare historical LLM factor values for correlation...")
                 existing_parquet = collector_existing.update_dsl_factors(
                     output_path=llm_factor_parquet_path.parent / "existing_llm_factors.parquet",
                     batch_size=100,
                 )
                 existing_df = load_llm_factors(Path(existing_parquet))
-                existing_df_scope = apply_corr_scope(existing_df, ric_assets, ric_start, ric_end)
-                print(f"[workflow] Corr[new_vs_old_llm] {corr_input_summary(existing_df_scope, label='old(llm_library)')}")
+                train_old_scope = apply_corr_scope(existing_df, selection_metric_assets, corr_train_start, corr_train_end)
+                valid_old_scope = apply_corr_scope(existing_df, selection_metric_assets, corr_valid_start, corr_valid_end)
+                print(f"[workflow] Corr input(train.old_llm): {corr_input_summary(train_old_scope, label='old_llm')}")
+                print(f"[workflow] Corr input(valid.old_llm): {corr_input_summary(valid_old_scope, label='old_llm')}")
                 return existing_df
 
             old_llm_loader = _load_existing_llm_df
+        else:
+            print("[workflow] No historical LLM factors for old-LLM correlation.")
 
-        print("[workflow] Call selection.run_selection_pipeline")
+        expr_map = {f.name: f.expression for f in new_factors}
+        print("[workflow] Call selection.run_selection_pipeline (full metrics + intersection filter)")
         stage_started = time.perf_counter()
         selection_result = run_selection_pipeline(
             SelectionInput(
-                ric_df=ric_df,
+                train_ric_df=train_ric_df,
+                valid_ric_df=valid_ric_df,
                 new_llm_df=llm_df,
                 base_df=base_df,
-                assets=[str(asset) for asset in ric_assets],
-                start_date=ric_start,
-                end_date=ric_end,
+                expr_map=expr_map,
+                assets=selection_metric_assets,
+                train_start_date=train_start,
+                train_end_date=train_end,
+                valid_start_date=valid_start,
+                valid_end_date=valid_end,
                 old_llm_df_loader=old_llm_loader,
             ),
             selection_cfg,
@@ -532,156 +747,82 @@ def main() -> None:
             f"elapsed={time.perf_counter() - stage_started:.2f}s"
         )
 
-        corr_df = selection_result.corr_new_vs_base if selection_result.corr_new_vs_base is not None else empty_corr_df()
-        corr_pairs = len(corr_df) if corr_df is not None else 0
-        corr_llm_factors = int(corr_df["llm_factor"].nunique()) if corr_df is not None and not corr_df.empty else 0
-        print(
-            f"[workflow] Corr[new_vs_base] done | pairs={corr_pairs} | llm_factors={corr_llm_factors} | "
-            f"elapsed={selection_result.elapsed_new_vs_base:.2f}s"
-        )
         ensure_dir(str(corr_output_new_vs_base_path.parent))
-        corr_df.to_csv(corr_output_new_vs_base_path, index=False)
-
-        ric_passed = set(selection_result.ric_passed_factors)
-        if not ric_passed:
-            print("[workflow] No factors passed RIC thresholds; skip correlation and continue.")
-            print(f"[workflow] Iteration elapsed={time.perf_counter() - iter_started:.2f}s")
-            continue
-
-        print("[workflow] RIC 通过的因子明细：")
-        for detail_line in format_ric_passed_details(ric_df, corr_df, ric_passed):
-            print(detail_line)
-
-        self_corr_old_df = (
-            selection_result.corr_new_vs_old_llm
-            if selection_result.corr_new_vs_old_llm is not None
-            else empty_corr_df()
-        )
-        print(
-            f"[workflow] Corr[new_vs_old_llm] scope | assets={','.join(ric_assets)} | "
-            f"window={ric_start or 'unbounded'}->{ric_end or 'unbounded'} | min_obs={args.min_corr_obs}"
-        )
-        if selection_result.old_llm_gate_applied:
-            llm_df_base_passed = llm_df[llm_df["factor_tag"].isin(set(selection_result.passed_after_base_corr))]
-            llm_df_base_scope = apply_corr_scope(llm_df_base_passed, ric_assets, ric_start, ric_end)
-            print(f"[workflow] Corr[new_vs_old_llm] {corr_input_summary(llm_df_base_scope, label='new(passed_base_corr)')}")
-            print(
-                f"[workflow] Corr[new_vs_old_llm] done | pairs={len(self_corr_old_df)} | "
-                f"elapsed={selection_result.elapsed_new_vs_old_llm:.2f}s"
-            )
-            if self_corr_old_df.empty:
-                print("[workflow] No overlap to compute new-vs-old-llm correlation.")
-            else:
-                print("[workflow] Top self-corr: new-llm vs old-llm:")
-                for row in top_self_corr(self_corr_old_df).itertuples():
-                    print(
-                        f"  - {row.llm_factor} vs {row.base_factor} | corr={row.weighted_corr:.4f} "
-                        f"|abs|={row.abs_corr:.4f} | obs={row.total_obs}"
-                    )
-            if selection_result.dropped_by_old_llm_corr:
-                print(
-                    f"[workflow] Dropped {len(selection_result.dropped_by_old_llm_corr)} factors due to "
-                    f"new-vs-old-llm corr > {args.llm_self_corr_threshold}: "
-                    f"{', '.join(selection_result.dropped_by_old_llm_corr)}"
-                )
-        else:
-            if not historical_llm:
-                print("[workflow] No historical LLM factors for new-vs-old-llm correlation.")
-            else:
-                print(
-                    "[workflow] Skip new-vs-old-llm correlation: "
-                    f"{selection_result.old_llm_gate_reason or 'no_reason'}"
-                )
+        selection_result.corr_train_new_vs_base.to_csv(corr_output_new_vs_base_path, index=False)
         ensure_dir(str(corr_output_new_vs_old_llm_path.parent))
-        self_corr_old_df.to_csv(corr_output_new_vs_old_llm_path, index=False)
-
-        self_corr_new_df = (
-            selection_result.corr_new_vs_new_llm
-            if selection_result.corr_new_vs_new_llm is not None
-            else empty_corr_df()
-        )
-        print(
-            f"[workflow] Corr[new_vs_new_llm] scope | assets={','.join(ric_assets)} | "
-            f"window={ric_start or 'unbounded'}->{ric_end or 'unbounded'} | min_obs={args.min_corr_obs}"
-        )
-        if selection_result.new_llm_gate_applied:
-            pre_new_gate = [
-                factor
-                for factor in selection_result.passed_after_base_corr
-                if factor not in set(selection_result.dropped_by_old_llm_corr)
-            ]
-            llm_df_pre_new = llm_df[llm_df["factor_tag"].isin(set(pre_new_gate))]
-            llm_df_pre_new_scope = apply_corr_scope(llm_df_pre_new, ric_assets, ric_start, ric_end)
-            print(f"[workflow] Corr[new_vs_new_llm] {corr_input_summary(llm_df_pre_new_scope, label='new(candidates)')}")
-            print(
-                f"[workflow] Corr[new_vs_new_llm] done | pairs={len(self_corr_new_df)} | "
-                f"elapsed={selection_result.elapsed_new_vs_new_llm:.2f}s"
-            )
-            if self_corr_new_df.empty:
-                print("[workflow] No overlap to compute new-vs-new-llm correlation.")
-            else:
-                print("[workflow] Top self-corr: new-llm vs new-llm:")
-                for row in top_self_corr(self_corr_new_df).itertuples():
-                    print(
-                        f"  - {row.llm_factor} vs {row.base_factor} | corr={row.weighted_corr:.4f} "
-                        f"|abs|={row.abs_corr:.4f} | obs={row.total_obs}"
-                    )
-            if selection_result.dropped_by_new_llm_corr:
-                print(
-                    f"[workflow] Dropped {len(selection_result.dropped_by_new_llm_corr)} factors due to "
-                    f"new-vs-new-llm corr > {args.llm_self_corr_threshold}: "
-                    f"{', '.join(selection_result.dropped_by_new_llm_corr)}"
-                )
-        else:
-            print(
-                "[workflow] Skip new-vs-new-llm correlation: "
-                f"{selection_result.new_llm_gate_reason or 'no_reason'}"
-            )
+        selection_result.corr_train_new_vs_old_llm.to_csv(corr_output_new_vs_old_llm_path, index=False)
         ensure_dir(str(corr_output_new_vs_new_llm_path.parent))
-        self_corr_new_df.to_csv(corr_output_new_vs_new_llm_path, index=False)
+        selection_result.corr_train_new_vs_new_llm.to_csv(corr_output_new_vs_new_llm_path, index=False)
+        ensure_dir(str(corr_output_valid_new_vs_base_path.parent))
+        selection_result.corr_valid_new_vs_base.to_csv(corr_output_valid_new_vs_base_path, index=False)
+        ensure_dir(str(corr_output_valid_new_vs_old_llm_path.parent))
+        selection_result.corr_valid_new_vs_old_llm.to_csv(corr_output_valid_new_vs_old_llm_path, index=False)
+        ensure_dir(str(corr_output_valid_new_vs_new_llm_path.parent))
+        selection_result.corr_valid_new_vs_new_llm.to_csv(corr_output_valid_new_vs_new_llm_path, index=False)
 
+        metrics_df = selection_result.metrics_df
         passed = selection_result.passed_factors
+        failed = selection_result.failed_factors
+        print(
+            f"[workflow] Metrics evaluated | candidates={len(metrics_df)} | "
+            f"passed={len(passed)} | failed={len(failed)}"
+        )
+        if selection_result.skipped_criteria:
+            skipped_text = ", ".join(f"{k}:{v}" for k, v in sorted(selection_result.skipped_criteria.items()))
+            print(f"[workflow] Skipped criteria: {skipped_text}")
+
+        def _print_top_corr(label: str, corr_df: pd.DataFrame) -> None:
+            if corr_df is None or corr_df.empty:
+                print(f"[workflow] {label}: no overlap")
+                return
+            print(f"[workflow] {label}:")
+            topk = max(1, int(selection_cfg.log_topk))
+            top_rows = corr_df.sort_values("abs_corr", ascending=False).head(topk)
+            for row in top_rows.itertuples():
+                print(
+                    f"  - {row.llm_factor} vs {row.base_factor} | "
+                    f"corr={row.weighted_corr:.4f} |abs|={row.abs_corr:.4f} | obs={row.total_obs}"
+                )
+
+        _print_top_corr("Top corr(train, new_vs_base)", selection_result.corr_train_new_vs_base)
+        _print_top_corr("Top corr(train, new_vs_old_llm)", selection_result.corr_train_new_vs_old_llm)
+        _print_top_corr("Top corr(train, new_vs_new_llm)", selection_result.corr_train_new_vs_new_llm)
+
+        if failed:
+            failed_view = metrics_df[metrics_df["final_status"] != "success"][["factor_id", "failure_reason"]].head(5)
+            print("[workflow] Failed factors preview:")
+            for row in failed_view.itertuples(index=False):
+                print(f"  - {row.factor_id} | reason={row.failure_reason}")
+
+        candidate_meta_map = {f.name: _factor_to_meta(f) for f in new_factors}
+        llm_meta_map = _load_factor_meta(llm_factor_library_path)
+        reference_meta_map = dict(base_meta_map)
+        reference_meta_map.update(llm_meta_map)
+        memory_df = build_memory_records(
+            metrics_df,
+            round_id=str(it + 1),
+            batch_id=f"iter_{it + 1}",
+            factor_meta_map=candidate_meta_map,
+            reference_meta_map=reference_meta_map,
+        )
+        success_df = memory_df[memory_df["final_status"] == "success"]
+        failure_df = memory_df[memory_df["final_status"] != "success"]
+        append_memory_csv(success_cases_path, success_df)
+        append_memory_csv(failure_cases_path, failure_df)
+        print(
+            f"[workflow] Memory updated | success_rows={len(success_df)} -> {success_cases_path} | "
+            f"failure_rows={len(failure_df)} -> {failure_cases_path}"
+        )
+
         if not passed:
-            print("[workflow] No factors passed thresholds; continue to next iteration.")
+            print("[workflow] No factors passed intersection criteria; continue to next iteration.")
             print(f"[workflow] Iteration elapsed={time.perf_counter() - iter_started:.2f}s")
             continue
 
-        # Map expressions/explanations from LLM cache
-        llm_cache_path = Path(cfg["paths"].get("llm_factor_cache"))
-        llm_fs = deserialize_factor_set(str(llm_cache_path))
-        expr_map = {f.name: f.expression for f in llm_fs.factors}
-        expl_map = {f.name: f.explanation for f in llm_fs.factors}
-        ref_map = {f.name: getattr(f, "references", None) for f in llm_fs.factors}
-
-        # 5) Complexity gate (only after RIC + correlation selection passed)
-        if selection_cfg.complexity_enabled:
-            print(
-                f"[workflow] Complexity gate | candidates={len(passed)} | "
-                f"max_ops={selection_cfg.complexity_max_ops} | max_depth={selection_cfg.complexity_max_depth}"
-            )
-            passed_after_complexity, dropped_complexity = apply_complexity_gate(
-                passed,
-                expr_map,
-                enabled=True,
-                max_ops=selection_cfg.complexity_max_ops,
-                max_depth=selection_cfg.complexity_max_depth,
-            )
-            if dropped_complexity:
-                print(f"[workflow] Dropped {len(dropped_complexity)} factors by complexity:")
-                for item in dropped_complexity:
-                    print(
-                        f"  - {item.factor} | ops={item.ops if item.ops is not None else 'N/A'} | "
-                        f"depth={item.depth if item.depth is not None else 'N/A'} | reason={item.reason}"
-                    )
-            passed = passed_after_complexity
-            print(f"[workflow] Complexity gate done | kept={len(passed)}")
-            if not passed:
-                print("[workflow] No factors passed complexity gate; continue to next iteration.")
-                print(f"[workflow] Iteration elapsed={time.perf_counter() - iter_started:.2f}s")
-                continue
-
+        expl_map = {f.name: f.explanation for f in new_factors}
+        ref_map = {f.name: getattr(f, "references", None) for f in new_factors}
         selected_exprs = {name: expr_map[name] for name in passed if name in expr_map}
-        selected_expl = {name: expl_map.get(name) for name in passed if name in expl_map}
+        selected_expl = {name: expl_map.get(name) for name in passed}
         selected_refs = {name: ref_map.get(name) for name in passed}
 
         factors_path = llm_factor_library_path

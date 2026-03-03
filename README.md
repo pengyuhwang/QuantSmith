@@ -1,16 +1,17 @@
 # LLMQuant
 
-LLMQuant 是一个面向量化因子挖掘的工程化闭环：
-- 用可配置的 `base` 因子库构建上下文（CSS + CoE）。
-- 调用 LLM 生成新因子表达式（DSL）。
-- 计算新因子值、RIC、相关性并做筛选。
-- 通过筛选后写入 `LLM_library`，进入后续迭代。
+LLMQuant 是一个面向量化因子挖掘的闭环工程，当前主流程是：
 
-推荐入口：`scripts/workflow_llm_factors.py`
+1. 用可配置的 `base` 因子库构建上下文（CSS + CoE）。
+2. 调用 LLM 生成 DSL 因子表达式。
+3. 计算新因子值与训练/验证指标（RIC + 相关性 + 复杂度）。
+4. 走交集筛选规则，成功因子入正式库，全部因子进入成功/失败记忆库。
+
+主入口：`scripts/workflow_llm_factors.py`
 
 ---
 
-## 1. 快速开始（3 分钟）
+## 1. 快速开始
 
 ### 1.1 安装依赖
 
@@ -18,34 +19,37 @@ LLMQuant 是一个面向量化因子挖掘的工程化闭环：
 pip install -r requirements.txt
 ```
 
-### 1.2 配置 API Key（可选）
+### 1.2 配置模型 API（可选）
 
-默认使用 SiliconFlow，在 `fama/config/defaults.yaml` 里配置。
+默认配置在 `fama/config/defaults.yaml` 的 `llm` 段。  
+如使用 SiliconFlow：
 
 ```bash
 export SiliconFlow_API_KEY="your_key"
 ```
 
-无可用 key 时，`fama/mining/llm_client.py` 会走 fallback（用于链路联调，不建议长期用于实盘研究）。
+无可用 key 时会走 fallback，仅用于链路联调。
 
 ### 1.3 检查关键输入
 
-- 行情文件存在：`data/fof_price_updating_intact.parquet`
-- base 因子源存在：`data/factor_cache_new/alpha101.yaml`、`data/factor_cache_new/alpha158.yaml`
-- `fama/config/defaults.yaml` 中路径与本机目录一致
+- 行情文件：`data/fof_price_updating_intact.parquet`
+- base 源文件：
+`data/factor_cache_new/alpha101.yaml`、`data/factor_cache_new/alpha158.yaml`
+- 配置文件：`fama/config/defaults.yaml`
 
-### 1.4 运行 workflow
+### 1.4 启动 workflow
 
 ```bash
 python scripts/workflow_llm_factors.py
 ```
 
-可选覆盖参数示例：
+可选覆盖参数（仅覆盖当次运行）：
 
 ```bash
 python scripts/workflow_llm_factors.py \
   --config fama/config/defaults.yaml \
   --iterations 20 \
+  --assets 000905.SH \
   --ric-threshold 0.08 \
   --corr-threshold 0.95 \
   --llm-self-corr-threshold 0.95 \
@@ -54,214 +58,208 @@ python scripts/workflow_llm_factors.py \
 
 ---
 
-## 2. 项目流程（单轮迭代）
+## 2. 单轮流程（当前代码行为）
 
-1. 读取配置并解析路径。
-2. 根据 `base_catalog.selected_sources` 合并 base 源，生成 `tmp/base_factor_cache_resolved.yaml`。
-3. `PromptOrchestrator.run(use_css=True, use_coe=True)`：基于 base 因子值与 RIC 构造 CSS/CoE 上下文并请求 LLM。
-4. 将本轮新因子写入 `tmp/llm_factor_cache_tmp.yaml`。
-5. 仅计算本轮新因子值，输出 `scripts/LLM_factors/dsl_LLM_factors_new.parquet`。
-6. 计算本轮新因子 RIC，输出 `tmp/llm_factor_ric.csv`。
-7. 做 `new-vs-base` 相关性筛选。
-8. 做 `new-vs-old-llm` 相关性筛选。
-9. 做 `new-vs-new-llm` 去重。
-10. 通过筛选后追加到 `data/factor_cache_new/LLM_library.yaml`。
+每一轮 `Iteration` 的执行顺序如下：
 
----
+1. 解析配置与路径，合并 base 源，生成 `tmp/base_factor_cache_resolved.yaml`。
+2. 创建 `PromptOrchestrator`：
+   - 读取 base 源并计算 base 因子值到 `paths.factor_base_parquet`。
+   - 按 `css.cluster_window_mode` 对 base 因子矩阵切窗做 CSS 聚类。
+   - 按 `coe.ric_window_mode` + `coe.ric_asset_mode` 计算/加载 base RIC（`paths.factor_ric_base`）并构建 CoE 链。
+3. 调 LLM 生成候选表达式，做 DSL 白名单校验后写入 LLM 缓存。
+4. 仅对“本轮新增因子”计算因子值，输出 `paths.llm_factor_parquet`。
+5. 计算训练集 RIC：输出 `paths.factor_ric_llm`。
+6. 计算验证集 RIC：输出 `paths.factor_ric_llm_valid`。
+7. 进入 `selection.run_selection_pipeline`（全量指标）：
+   - 复杂度：`operator_count`、`nesting_depth`、`expression_size`
+   - 训练相关性：`new_vs_base`、`new_vs_old_llm`、`new_vs_new_llm`
+   - 验证相关性：同上三类
+   - 汇总 `train_max_corr` / `valid_max_corr`（取 base 与 old_llm 的最大者）
+8. 按 `selection.criteria` 做交集筛选（启用的规则必须全部通过）。
+9. 写记忆库：
+   - 成功：`paths.factor_success_cases`
+   - 失败：`paths.factor_failure_cases`
+10. 将通过筛选的因子追加到 `paths.llm_factor_library`。
 
-## 3. 目录说明（关键文件）
+说明：
 
-```text
-LLMQuant/
-├── scripts/
-│   ├── workflow_llm_factors.py         # 主流程入口
-│   └── LLM_factors/
-│       ├── dsl_LLM_factors_new.parquet # 本轮新因子值（覆盖）
-│       └── existing_llm_factors.parquet# 历史 LLM 因子值（筛选阶段生成）
-├── fama/
-│   ├── config/defaults.yaml            # 统一配置盘
-│   ├── mining/orchestrator.py          # CSS/CoE/Prompt/LLM 编排
-│   ├── mining/llm_client.py            # LLM 客户端与 fallback
-│   └── data/factor_space.py            # Factor / FactorSet YAML 结构
-├── utils/
-│   ├── factor_catalog.py               # 合并 base 源（alpha101/alpha158/...）
-│   ├── factor_collection_dsl.py        # DSL 因子值计算（KunQuant）
-│   ├── kun_backend.py                  # DSL AST -> KunQuant 执行
-│   ├── ric_engine.py                   # 统一 RIC/IC/ICIR 计算引擎
-│   ├── compute_correlation_new.py      # Spearman 相关性计算
-│   ├── factor_collection.py            # 因子集合基类
-│   └── backtest_utils.py               # prepare_price_data 等基础工具
-├── data/
-│   ├── fof_price_updating_intact.parquet
-│   ├── base_factors/                   # base 因子值目录（相关性 reference）
-│   └── factor_cache_new/
-│       ├── alpha101.yaml               # base 源：alpha101
-│       ├── alpha158.yaml               # base 源：alpha158
-│       ├── LLM_factors.yaml            # LLM 工作缓存
-│       └── LLM_library.yaml            # LLM 正式入库库（持久）
-├── factor_value_prepared/
-│   └── data/factors/
-│       ├── dsl_factors_new.parquet     # base 因子值长表（供 CSS/CoE）
-│       └── factor_ric.csv              # base 因子 RIC（供 CSS/CoE）
-└── tmp/                                # workflow 中间产物（大多覆盖）
-```
+- 主筛选是“交集规则”。
+- 记忆库记录的是“全量评估结果”，不是只记录通过项。
 
 ---
 
-## 4. 配置说明（defaults.yaml）
+## 3. 配置说明（defaults.yaml）
 
-核心配置文件：`fama/config/defaults.yaml`
+核心配置：`fama/config/defaults.yaml`
 
-### 4.1 workflow / selection 超参数
+### 3.1 全局资产与时间窗
 
-- `workflow.iterations`：迭代轮数
-- `selection.ric_threshold`：新因子 RIC 门槛（按目标资产逐个校验）
-- `selection.corr_threshold`：new-vs-base 最大允许相关性
-- `selection.llm_self_corr_threshold`：new-vs-old/new-vs-new 最大允许相关性
-- `selection.min_corr_obs`：相关性最小重叠样本
-- `selection.complexity.enabled / max_ops / max_depth`：复杂度过滤开关与阈值（在 RIC+相关性筛选后执行）
+- `assets`：项目全局资产列表（RIC / CoE / selection 默认都从这里取）。
+- `windows.train.start_date/end_date`：训练窗口。
+- `windows.valid.start_date/end_date`：验证窗口。
 
-兼容说明：
-- `workflow.ric_threshold / corr_threshold / llm_self_corr_threshold / min_corr_obs` 仍可作为回退键，但建议统一迁移到 `selection.*`。
+### 3.2 CSS 与 CoE
 
-### 4.2 RIC 参数
+- `css.cluster_window_mode`：`train|valid|full|custom`
+- `css.cluster_start_date` / `css.cluster_end_date`：`custom` 模式下生效。
 
-- `ric.assets`
-- `ric.min_obs`
-- `ric.start_date`
-- `ric.end_date`
+- `coe.ric_window_mode`：`train|valid|full|custom`
+- `coe.ric_start_date` / `coe.ric_end_date`：`custom` 模式下生效。
+- `coe.ric_asset_mode`：`global|custom`
+- `coe.ric_assets`：`custom` 模式下生效。
+- `coe.max_depth` / `coe.min_rankic` / `coe.prompt_chains`：CoE 链控制。
 
-### 4.3 base 源配置
+### 3.3 Selection（筛选）配置
 
-- `base_catalog.selected_sources: ["alpha101", "alpha158"]`
-- `base_catalog.include_llm_library_in_base`
+- `selection.min_corr_obs`：相关性最小重叠样本数。
+- `selection.require_full_asset_coverage`：RIC 是否要求覆盖全部资产。
+- `selection.log_topk`：日志里展示 TopK 相关对。
 
-运行时会把选定源合并到：
-- `paths.base_factor_cache_resolved`（默认 `tmp/base_factor_cache_resolved.yaml`）
+- `selection.scope.asset_mode`：`global|custom`
+- `selection.scope.assets`：`custom` 时使用。
+- `selection.scope.train_window_mode`：`train|valid|full|custom`
+- `selection.scope.valid_window_mode`：`train|valid|full|custom`
+- `selection.scope.train_start_date/end_date`：`train_window_mode=custom` 时使用。
+- `selection.scope.valid_start_date/end_date`：`valid_window_mode=custom` 时使用。
 
-### 4.4 关键路径
+- `selection.criteria.*`：交集筛选规则。当前支持：
+  - `train_min_abs_ric`
+  - `train_max_abs_corr_base`
+  - `train_max_abs_corr_old_llm`
+  - `train_max_abs_corr_new_llm`
+  - `valid_min_abs_ric`
+  - `valid_max_abs_corr_base`
+  - `valid_max_abs_corr_old_llm`
+  - `valid_max_abs_corr_new_llm`
+  - `max_operator_count`
+  - `max_nesting_depth`
+
+### 3.4 Base 源合并
+
+- `base_catalog.selected_sources`：可选 `alpha101`、`alpha158`
+- `base_catalog.include_llm_library_in_base`：是否把正式 LLM 库并入 base
+- 运行时会合并到：`paths.base_factor_cache_resolved`
+
+### 3.5 关键路径
 
 - 行情：`paths.market_data`
 - base 因子值：`paths.factor_base_parquet`
 - base RIC：`paths.factor_ric_base`
-- 本轮 LLM 因子值：`paths.llm_factor_parquet`
-- 本轮 LLM RIC：`paths.factor_ric_llm`
-- 相关性输出：`paths.corr_output_new_vs_base` / `paths.corr_output_new_vs_old_llm` / `paths.corr_output_new_vs_new_llm`
-- 入库目标：`paths.llm_factor_library`
+- 本轮新因子值：`paths.llm_factor_parquet`
+- 本轮训练/验证 RIC：`paths.factor_ric_llm` / `paths.factor_ric_llm_valid`
+- 相关性输出（train/valid 三类）：`paths.corr_output_*`
+- 正式入库：`paths.llm_factor_library`
+- 记忆库：
+  - `paths.factor_success_cases`
+  - `paths.factor_failure_cases`
+
+### 3.6 记忆库字段（核心）
+
+记忆库由 `fama/memory/memory.py` 生成，成功与失败使用同一套字段。常用字段：
+
+- 基础信息：`factor_id`、`round_id`、`batch_id`、`formula`、`formula_hash`
+- 训练指标：`train_ic`、`train_ric`、`train_icir`、`train_max_corr`、`train_max_corr_factor_id`
+- 验证指标：`valid_ic`、`valid_ric`、`valid_icir`、`valid_max_corr`、`valid_max_corr_factor_id`
+- 复杂度：`operator_count`、`nesting_depth`、`expression_size`
+- 决策结果：`final_status`、`failure_stage`、`failure_reason`
 
 ---
 
-## 5. 数据格式约定
+## 4. 目录与产物
 
-### 5.1 因子 YAML（FactorSet）
+```text
+LLMQuant/
+├── scripts/
+│   ├── workflow_llm_factors.py
+│   └── LLM_factors/
+│       ├── dsl_LLM_factors_new.parquet
+│       └── existing_llm_factors.parquet
+├── fama/
+│   ├── config/defaults.yaml
+│   ├── mining/orchestrator.py
+│   ├── selection/
+│   └── memory/
+├── utils/
+│   ├── factor_collection_dsl.py
+│   ├── ric_engine.py
+│   ├── compute_correlation_new.py
+│   ├── factor_catalog.py
+│   ├── kun_backend.py
+│   └── backtest_utils.py
+├── data/
+│   ├── factor_cache_new/
+│   │   ├── alpha101.yaml
+│   │   ├── alpha158.yaml
+│   │   ├── LLM_factors.yaml
+│   │   └── LLM_library.yaml
+│   ├── base_factors/
+│   └── memory/
+│       ├── factor_success_cases.csv
+│       └── factor_failure_cases.csv
+├── factor_value_prepared/data/factors/
+│   ├── dsl_factors_new.parquet
+│   └── factor_ric.csv
+└── tmp/
+```
 
-每个因子条目包含：
-- `name`
-- `expression`
-- `explanation`（可空）
-- `references`（可空）
+覆盖策略（默认）：
 
-实现：`fama/data/factor_space.py`
-
-### 5.2 因子值长表（统一列）
-
-- `time`
-- `unique_id`
-- `factor_tag`
-- `value`
-
-### 5.3 RIC 输出
-
-`utils/ric_engine.py` 输出（csv/parquet）常用字段：
-- `unique_id` / `asset`
-- `factor_tag`
-- `ric` / `abs_ric`
-- `sample_count`
-- `start_date` / `end_date`
-- 可选：`ic` / `icir`
-
-### 5.4 相关性输出
-
-`utils/compute_correlation_new.py` 输出字段：
-- `llm_factor`
-- `base_factor`
-- `weighted_corr`
-- `abs_corr`
-- `total_obs`
-- `asset_pairs`
-
----
-
-## 6. 产物与覆盖策略
-
-### 6.1 相对稳定的基础产物
-
-- `factor_value_prepared/data/factors/dsl_factors_new.parquet`
-- `factor_value_prepared/data/factors/factor_ric.csv`
-
-这两份通常用于 CSS/CoE 的 base 上下文。
-
-### 6.2 每轮覆盖的中间产物
-
-- `tmp/llm-factor.yaml`
-- `tmp/llm_factor_cache_tmp.yaml`
-- `scripts/LLM_factors/dsl_LLM_factors_new.parquet`
-- `tmp/llm_factor_ric.csv`
-- `tmp/new_llm_vs_base_corr.csv`
-- `tmp/new_llm_vs_old_llm_corr.csv`
-- `tmp/new_llm_vs_new_llm_corr.csv`
-
-### 6.3 持久化入库
-
-- `data/factor_cache_new/LLM_library.yaml`
-
-仅通过筛选的因子会追加到这里。
+- `tmp/` 下多数文件按轮覆盖。
+- `scripts/LLM_factors/dsl_LLM_factors_new.parquet` 按轮覆盖。
+- `data/factor_cache_new/LLM_library.yaml` 追加。
+- `data/memory/factor_success_cases.csv` / `data/memory/factor_failure_cases.csv` 追加。
 
 ---
 
-## 7. 常见问题
+## 5. 主要日志解读
 
-### 7.1 为什么有表达式被跳过？
+你会在终端看到这些关键行：
 
-常见原因：
-- 使用了不在白名单中的算子。
-- 使用了 `>` / `<` / `>=` / `<=`，而不是 `GT/GE/LT/LE/EQ`。
-- 参数个数不符合约束。
-
-### 7.2 为什么没有因子入库？
-
-可能卡在任一关：
-- RIC 不达标
-- new-vs-base 相关性过高
-- new-vs-old/new-vs-new 去重淘汰
-
-### 7.3 `base_factor_cache_resolved.yaml` 什么时候生成？
-
-在 workflow 初始化与 orchestrator 初始化阶段都会触发 base 源解析，写入同一路径（覆盖）。
-
-### 7.4 相关性筛选的时间段由谁控制？
-
-与 RIC 一致，来自：
-- `ric.start_date`
-- `ric.end_date`
-
-并可被命令行 `--ric-start` / `--ric-end` 覆盖。
+- `Runtime params`：全局资产、selection 实际资产、训练阈值。
+- `Criteria enabled`：当前启用/关闭的筛选规则。
+- `Corr scope source`：train/valid 相关性窗口取值来源。
+- `Window policy`（orchestrator）：CSS/CoE 的窗口与资产策略。
+- `Metrics evaluated`：本轮候选、通过、失败数量。
+- `Memory updated`：成功/失败记忆条数与目标文件。
 
 ---
 
-## 8. 单模块运行（调试用）
+## 6. 常见问题
 
-### 8.1 单独计算 DSL 因子值
+### 6.1 `Skipping invalid expression ... 函数不在白名单`
+
+代表 LLM 产物用了未允许算子（如 `TS_CORREL`），会被语法校验阶段过滤，不进入后续计算。
+
+### 6.2 验证集 `rows=0` 的 RIC
+
+常见原因是验证窗口内可用样本不足、或资产/时间无重叠。
+
+### 6.3 为什么会看到 `new_vs_new_llm`
+
+当本轮新因子数 `>=2` 时，selection 会计算新因子两两相关性用于去冗余。
+
+### 6.4 `tmp/base_factor_cache_resolved.yaml` 是否每轮生成
+
+每次 workflow 启动与 orchestrator 初始化都会按当前配置重建同一路径（覆盖写）。
+
+---
+
+## 7. 单模块调试
+
+### 7.1 手动计算 DSL 因子值
 
 ```bash
 python utils/factor_collection_dsl.py
 ```
 
-说明：
-- `__main__` 默认按 `batch_size=500` 运行。
-- 默认读取 base 缓存（解析后路径），输出到 base 因子目录。
+默认行为：
 
-### 8.2 单独计算相关性
+- 优先读取 `tmp/base_factor_cache_resolved.yaml`。
+- 若不存在会按 `base_catalog` 自动解析合并 base 源。
+- 默认输出 `factor_value_prepared/data/factors/dsl_factors_new.parquet`。
+
+### 7.2 手动计算相关性
 
 ```bash
 python utils/compute_correlation_new.py \
@@ -270,13 +268,14 @@ python utils/compute_correlation_new.py \
   --output-dir tmp
 ```
 
-注意：该脚本的默认 CLI 路径仍带历史示例，建议始终显式传参。
-
 ---
 
-## 9. 开发约定
+## 8. 开发约定
 
-1. 路径与阈值优先在 `defaults.yaml` 配置，不在代码里硬编码。
-2. 计算引擎能力尽量统一到 `utils/`，workflow 只做编排。
-3. 长表列标准统一为 `time/unique_id/factor_tag/value`。
-4. 新增功能优先保证“可替换、可观测、可复用”（日志、参数、模块边界清晰）。
+1. 路径、阈值、窗口、资产优先放 `defaults.yaml`。
+2. `utils/` 放计算引擎，workflow 只做编排与落盘。
+3. 因子长表统一列：`time/unique_id/factor_tag/value`。
+4. 新功能优先保证：
+   - 参数可控
+   - 日志可观测
+   - 模块可替换

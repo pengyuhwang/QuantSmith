@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 
@@ -21,6 +22,17 @@ from utils.factor_catalog import load_factor_name_set, resolve_base_factor_cache
 from utils.ric_engine import compute_rankic_from_files, resolve_ric_params
 from fama.selection.config import apply_selection_overrides, load_selection_config
 from fama.memory import append_memory_csv, build_memory_records
+from fama.memory.llm_agents import run_retrieval_planner, run_round_analyst
+from fama.memory.round_memory import (
+    FactorLibraryIndex,
+    append_round_memory_csv,
+    build_retrieval_packet,
+    build_round_memory_row,
+    build_round_packet,
+    extract_reference_names_from_plan,
+    load_recent_round_context,
+    render_retrieval_guidance,
+)
 from fama.selection.models import SelectionInput
 from fama.selection.pipeline import run_selection_pipeline
 from fama.selection.reporting import (
@@ -242,6 +254,9 @@ def main() -> None:
     paths = cfg.setdefault("paths", {})
     workflow_cfg = cfg.get("workflow", {}) if isinstance(cfg.get("workflow"), dict) else {}
     selection_cfg = load_selection_config(cfg)
+    memory_cfg = cfg.get("memory", {}) if isinstance(cfg.get("memory"), dict) else {}
+    retrieval_cfg = memory_cfg.get("retrieval_planner", {}) if isinstance(memory_cfg.get("retrieval_planner"), dict) else {}
+    round_analyst_cfg = memory_cfg.get("round_analyst", {}) if isinstance(memory_cfg.get("round_analyst"), dict) else {}
 
     args.iterations = int(args.iterations) if args.iterations is not None else int(workflow_cfg.get("iterations", 1000))
     selection_cfg = apply_selection_overrides(
@@ -333,6 +348,13 @@ def main() -> None:
         paths.get("factor_failure_cases"),
         PROJECT_ROOT / "tmp" / "factor_failure_cases.csv",
     )
+    round_memory_path = _pick_path(
+        None,
+        paths.get("round_memory_csv"),
+        PROJECT_ROOT / "data" / "memory" / "round_memory.csv",
+    )
+    retrieval_prompt_dump_path = (PROJECT_ROOT / "tmp" / "retrieval_planner_prompt.json").resolve()
+    round_analyst_prompt_dump_path = (PROJECT_ROOT / "tmp" / "round_analyst_prompt.json").resolve()
     if price_path is None:
         raise ValueError("无法确定 market_data 路径，请设置 cfg.paths.market_data 或传入 --price-path。")
     if llm_factor_parquet_path is None:
@@ -359,6 +381,8 @@ def main() -> None:
         raise ValueError("无法确定 success cases 路径，请设置 cfg.paths.factor_success_cases。")
     if failure_cases_path is None:
         raise ValueError("无法确定 failure cases 路径，请设置 cfg.paths.factor_failure_cases。")
+    if round_memory_path is None:
+        raise ValueError("无法确定 round memory 路径，请设置 cfg.paths.round_memory_csv。")
 
     price_path = str(price_path.resolve())
     llm_factor_parquet_path = llm_factor_parquet_path.resolve()
@@ -374,6 +398,7 @@ def main() -> None:
     llm_factor_library_path = llm_factor_library_path.resolve()
     success_cases_path = success_cases_path.resolve()
     failure_cases_path = failure_cases_path.resolve()
+    round_memory_path = round_memory_path.resolve()
     llm_output_path = llm_output_path.resolve() if llm_output_path is not None else None
     cfg["paths"]["market_data"] = price_path
     cfg["paths"]["llm_factor_library"] = str(llm_factor_library_path)
@@ -484,12 +509,70 @@ def main() -> None:
         except Exception:
             llm_fs = FactorSet([])
         existing_names = {f.name for f in llm_fs.factors}
+        ensure_dir(str(retrieval_prompt_dump_path.parent))
+        retrieval_prompt_dump_path.write_text(
+            json.dumps(
+                {
+                    "agent": "retrieval_planner",
+                    "round_id": it + 1,
+                    "status": "not_invoked_yet",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        round_analyst_prompt_dump_path.write_text(
+            json.dumps(
+                {
+                    "agent": "round_analyst",
+                    "round_id": it + 1,
+                    "status": "not_invoked_yet",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        memory_guidance = ""
+        memory_reference_names: list[str] = []
+        if bool(memory_cfg.get("enabled", True)) and round_memory_path.exists():
+            factor_library = FactorLibraryIndex.from_paths(
+                base_factor_cache_path=base_resolved_path,
+                llm_factor_library_path=llm_factor_library_path,
+            )
+            retrieval_packet = build_retrieval_packet(
+                round_memory_path,
+                recent_rounds=int(retrieval_cfg.get("recent_rounds", 10) or 10),
+                top_pass_rounds=int(retrieval_cfg.get("top_pass_rounds", 3) or 3),
+                top_duplicate_rounds=int(retrieval_cfg.get("top_duplicate_rounds", 3) or 3),
+            )
+            retrieval_plan = run_retrieval_planner(
+                cfg,
+                retrieval_packet,
+                factor_library=factor_library,
+                dump_path=retrieval_prompt_dump_path,
+            )
+            memory_guidance = render_retrieval_guidance(retrieval_plan)
+            memory_reference_names = extract_reference_names_from_plan(retrieval_plan)
+            if memory_guidance:
+                print(
+                    f"[workflow] Memory retrieval ready | refs={len(memory_reference_names)} | "
+                    f"guidance_lines={len(memory_guidance.splitlines())} | "
+                    f"prompt_dump={retrieval_prompt_dump_path}"
+                )
 
         # 1) Generate expressions via CLI orchestrator
         print("[workflow] Call PromptOrchestrator.run(use_css=True, use_coe=True)")
         stage_started = time.perf_counter()
         orchestrator = PromptOrchestrator(cfg)
-        expressions = orchestrator.run(use_css=True, use_coe=True)
+        expressions = orchestrator.run(
+            use_css=True,
+            use_coe=True,
+            memory_guidance=memory_guidance,
+            memory_reference_names=memory_reference_names,
+        )
         print(
             f"[workflow] PromptOrchestrator finished | generated={len(expressions)} | "
             f"elapsed={time.perf_counter() - stage_started:.2f}s"
@@ -813,6 +896,39 @@ def main() -> None:
             f"[workflow] Memory updated | success_rows={len(success_df)} -> {success_cases_path} | "
             f"failure_rows={len(failure_df)} -> {failure_cases_path}"
         )
+
+        recent_context: list[dict[str, object]] = []
+        if bool(memory_cfg.get("enabled", True)) and round_memory_path.exists():
+            recent_context = load_recent_round_context(
+                round_memory_path,
+                limit=int(round_analyst_cfg.get("recent_context_rounds", 2) or 2),
+            )
+        round_packet = build_round_packet(
+            metrics_df,
+            round_id=str(it + 1),
+            batch_id=f"iter_{it + 1}",
+            factor_meta_map=candidate_meta_map,
+            reference_meta_map=reference_meta_map,
+            recent_context=recent_context,
+        )
+        round_reflection = {}
+        if bool(memory_cfg.get("enabled", True)):
+            round_reflection = run_round_analyst(
+                cfg,
+                round_packet,
+                dump_path=round_analyst_prompt_dump_path,
+            )
+        round_row = build_round_memory_row(round_packet, round_reflection)
+        append_round_memory_csv(round_memory_path, round_row)
+        if bool(memory_cfg.get("enabled", True)):
+            print(
+                f"[workflow] Round memory updated | round={it + 1} -> {round_memory_path} | "
+                f"prompt_dump={round_analyst_prompt_dump_path}"
+            )
+        else:
+            print(
+                f"[workflow] Round memory updated without reflection | round={it + 1} -> {round_memory_path}"
+            )
 
         if not passed:
             print("[workflow] No factors passed intersection criteria; continue to next iteration.")

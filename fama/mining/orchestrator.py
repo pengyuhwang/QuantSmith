@@ -160,7 +160,14 @@ class PromptOrchestrator:
         )
         self._load_precomputed_ric_files(log_missing=True)
 
-    def run(self, use_css: bool = True, use_coe: bool = True) -> list[str]:
+    def run(
+        self,
+        use_css: bool = True,
+        use_coe: bool = True,
+        *,
+        memory_guidance: str | None = None,
+        memory_reference_names: list[str] | None = None,
+    ) -> list[str]:
         """依据 CSS/CoE 开关执行一次挖掘流程。"""
 
         self.logger.info("Starting PromptOrchestrator run | CSS=%s | CoE=%s", use_css, use_coe)
@@ -170,8 +177,8 @@ class PromptOrchestrator:
         if use_coe:
             self.logger.info("调用 prepare_coe_context")
         coe_examples, coe_names = self.prepare_coe_context(self.factor_set) if use_coe else ([], [])
-        self._allowed_reference_names = set(css_names) | set(coe_names)
-        prompt = self.build_prompt(css_examples, coe_examples)
+        self._allowed_reference_names = set(css_names) | set(coe_names) | set(memory_reference_names or [])
+        prompt = self.build_prompt(css_examples, coe_examples, memory_guidance=memory_guidance)
         self.logger.info("LLM prompt payload:\n%s", prompt)
         expressions = self.call_llm(prompt)
         if expressions:
@@ -283,6 +290,8 @@ class PromptOrchestrator:
         self,
         css_examples: list[str],
         coe_examples: list[str],
+        *,
+        memory_guidance: str | None = None,
     ) -> str:
         """将约束注入 prompt_builder 并返回提示词。"""
 
@@ -293,6 +302,7 @@ class PromptOrchestrator:
             constraints,
             available_fields=self.prompt_allowed_fields,
             max_references=self.llm_cfg.get("max_reference_factors"),
+            memory_guidance=memory_guidance,
         )
 
     def call_llm(self, prompt: str) -> list[str]:
@@ -324,6 +334,7 @@ class PromptOrchestrator:
                 base_url=llm_cfg.get("base_url"),
                 allowed_fields=self.prompt_allowed_fields,
                 max_references=llm_cfg.get("max_reference_factors"),
+                reference_names=sorted(getattr(self, "_allowed_reference_names", set())),
                 parallel_calls=parallel_calls,
                 logger=self.logger,
             )

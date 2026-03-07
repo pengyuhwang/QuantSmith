@@ -64,7 +64,7 @@ def request_new_factors(
                     model=model,
                     temperature=float(temperature or 0.2),
                     messages=[
-                        {"role": "system", "content": "You are a quant researcher. Return one alpha per line."},
+                        {"role": "system", "content": "You are a quant researcher. Return strict JSON only."},
                         {"role": "user", "content": prompt},
                     ],
                 )

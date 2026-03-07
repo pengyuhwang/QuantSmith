@@ -27,11 +27,11 @@ ric:
 
 windows:
   train:
-    start_date: "2005-01-01"  # 训练集时间段起始（含）；默认用于 CoE/CSS/筛选 train
-    end_date: "2009-12-31"  # 训练集时间段结束（含）
+    start_date: "2014-01-01"  # 训练集时间段起始（含）；默认用于 CoE/CSS/筛选 train
+    end_date: "2018-12-31"  # 训练集时间段结束（含）
   valid:
-    start_date: "2010-01-01"  # 验证集时间段起始（含）；默认用于筛选 valid
-    end_date: "2011-12-31"  # 验证集时间段结束（含）
+    start_date: "2019-01-01"  # 验证集时间段起始（含）；默认用于筛选 valid
+    end_date: "2020-12-31"  # 验证集时间段结束（含）
 
 run:
   use_css: true
@@ -59,7 +59,7 @@ selection:
   criteria:
     train_min_abs_ric:
       enabled: true
-      threshold: 0.08
+      threshold: 0.06
     train_max_abs_corr_base:
       enabled: true
       threshold: 0.95
@@ -70,8 +70,8 @@ selection:
       enabled: true
       threshold: 0.95
     valid_min_abs_ric:
-      enabled: false
-      threshold: 0.0
+      enabled: true
+      threshold: 0.06
     valid_max_abs_corr_base:
       enabled: false
       threshold: 0.95
@@ -126,6 +126,7 @@ paths:
 
   factor_success_cases: "./data/memory/factor_success_cases.csv"  # 成功记忆库（通过交集筛选）
   factor_failure_cases: "./data/memory/factor_failure_cases.csv"  # 失败记忆库（未通过交集筛选）
+  round_memory_csv: "./data/memory/round_memory.csv"  # 一轮一行的轮次记忆库（含轮后复盘 JSON）
 
 llm:
 #  provider: "openai"
@@ -194,6 +195,29 @@ llm:
       #"DIFF_WITH_WEIGHTED_SUM",
     ]
   deny_fields: []  # 禁止 LLM 使用的字段黑名单（例如 ["VWAP"]）
+
+memory:
+  enabled: true
+  round_analyst:
+    recent_context_rounds: 2  # 轮后复盘时附带最近几轮的简短上下文
+    provider: null  # 缺省时继承 llm.provider
+    model: null  # 缺省时继承 llm.model
+    base_url: null  # 缺省时继承 llm.base_url
+    api_key_env: null  # 缺省时继承 llm.api_key_env
+    temperature: 0.4
+    thinking: "high"
+  retrieval_planner:
+    recent_rounds: 10  # 轮前检索读取最近多少轮 round_memory
+    top_pass_rounds: 3  # 额外强调通过率较高的轮次
+    top_duplicate_rounds: 3  # 额外强调重复失败较多的轮次
+    tool_max_calls: 4  # retrieval LLM 最多连续调用因子库查询工具的次数
+    tool_result_limit: 5  # 单次工具查询返回的最大因子数
+    provider: null  # 缺省时继承 llm.provider
+    model: null  # 缺省时继承 llm.model
+    base_url: null  # 缺省时继承 llm.base_url
+    api_key_env: null  # 缺省时继承 llm.api_key_env
+    temperature: 0.3
+    thinking: "high"
 logging:
   level: "INFO"
   log_file: "./logs/fama.log"

@@ -32,6 +32,7 @@ def build_prompt(
     *,
     available_fields: list[str],
     max_references: Optional[int] = None,
+    memory_guidance: str | None = None,
 ) -> str:
     """拼装 LLM 挖掘阶段所需的结构化提示词。"""
 
@@ -45,6 +46,7 @@ def build_prompt(
     checksum = _checksum(cards)
     css_block = "\n".join(f"- {expr}" for expr in css_examples) or "- (none)"
     coe_block = "\n".join(f"- {entry}" for entry in coe_path) or "- (none)"
+    memory_block = (memory_guidance or "").strip()
     fields_block = ", ".join(available_fields)
     max_new = constraints.get("max_new_factors", 5)
     ref_cap = max_references or constraints.get("max_reference_factors") or 3
@@ -98,6 +100,14 @@ def build_prompt(
 
     # Chain-of-Experience（同簇内按 RankIC 由弱到强的经验链）
     {coe_block}
+
+    [如何利用记忆检索引导]
+    - 下方内容来自近期轮次复盘与检索总结，目标是告诉你最近哪些结构更值得继续挖、哪些结构应避免。
+    - 优先吸收其中关于因子机制、经济学含义、市场行为解释的内容，而不是只关注指标高低。
+    - 如果记忆中给出了参考因子，请优先学习其结构机制与含义，再做有明确创新的延展。
+
+    # 记忆检索引导
+    {memory_block or '- (none)'}
     
     [输出格式与字段约束]
     - 仅允许使用以下字段（必须大写）：{fields_block}
@@ -105,8 +115,8 @@ def build_prompt(
     - 每个元素必须严格为以下格式（字段名固定，均为字符串）：
     {{
       "expression": "<合法 DSL 表达式，满足算子/字段/长度/嵌套约束>",
-      "explanation": "<一句中文经济学解释，仅一句，简洁说明该因子的经济含义>"
-      "references": ["<参考因子名1>", "<参考因子名2>", ...]  // 最多 {ref_cap} 个，应从上文 CSS/CoE 示例出现的因子名中选择；如无可引用则输出空数组 []
+      "explanation": "<一句中文经济学解释，仅一句，简洁说明该因子的经济含义>",
+      "references": ["<参考因子名1>", "<参考因子名2>", ...]  // 最多 {ref_cap} 个，应从上文 CSS/CoE/记忆检索引导中明确出现的因子名中选择；如无可引用则输出空数组 []
     }}
     - JSON 外 **不得包含任何额外文本、注释、编号、说明或反引号**；
     - 不要出现```json[]```包裹的形式

@@ -3,9 +3,11 @@
 LLMQuant 是一个面向量化因子挖掘的闭环工程，当前主流程是：
 
 1. 用可配置的 `base` 因子库构建上下文（CSS + CoE）。
-2. 调用 LLM 生成 DSL 因子表达式。
-3. 计算新因子值与训练/验证指标（RIC + 相关性 + 复杂度）。
-4. 走交集筛选规则，成功因子入正式库，全部因子进入成功/失败记忆库。
+2. 可选地读取近期 `round_memory.csv`，由检索 LLM 生成“记忆检索引导”并注入主 prompt。
+3. 调用主 LLM 生成 DSL 因子表达式。
+4. 计算新因子值与训练/验证指标（RIC + 相关性 + 复杂度）。
+5. 走交集筛选规则，成功因子入正式库，全部因子进入成功/失败记忆库。
+6. 生成本轮 `Round Packet`，并落盘到 `round_memory.csv`；若记忆模块开启，再由轮后复盘 LLM 写入结构化总结。
 
 主入口：`scripts/workflow_llm_factors.py`
 
@@ -63,29 +65,39 @@ python scripts/workflow_llm_factors.py \
 每一轮 `Iteration` 的执行顺序如下：
 
 1. 解析配置与路径，合并 base 源，生成 `tmp/base_factor_cache_resolved.yaml`。
-2. 创建 `PromptOrchestrator`：
+2. 若 `memory.enabled=true` 且已有 `paths.round_memory_csv`：
+   - 读取最近若干轮 `round_memory.csv`
+   - 调用 retrieval planner LLM，生成“记忆检索引导”
+   - 可通过本地因子库查询工具补充佐证因子（返回因子名、表达式、解释、references）
+   - 将检索结果注入主 prompt，并把检索输入保存到 `tmp/retrieval_planner_prompt.json`
+3. 创建 `PromptOrchestrator`：
    - 读取 base 源并计算 base 因子值到 `paths.factor_base_parquet`。
    - 按 `css.cluster_window_mode` 对 base 因子矩阵切窗做 CSS 聚类。
    - 按 `coe.ric_window_mode` + `coe.ric_asset_mode` 计算/加载 base RIC（`paths.factor_ric_base`）并构建 CoE 链。
-3. 调 LLM 生成候选表达式，做 DSL 白名单校验后写入 LLM 缓存。
-4. 仅对“本轮新增因子”计算因子值，输出 `paths.llm_factor_parquet`。
-5. 计算训练集 RIC：输出 `paths.factor_ric_llm`。
-6. 计算验证集 RIC：输出 `paths.factor_ric_llm_valid`。
-7. 进入 `selection.run_selection_pipeline`（全量指标）：
+4. 调主 LLM 生成候选表达式，做 DSL 白名单校验后写入 LLM 缓存。
+5. 仅对“本轮新增因子”计算因子值，输出 `paths.llm_factor_parquet`。
+6. 计算训练集 RIC：输出 `paths.factor_ric_llm`。
+7. 计算验证集 RIC：输出 `paths.factor_ric_llm_valid`。
+8. 进入 `selection.run_selection_pipeline`（全量指标）：
    - 复杂度：`operator_count`、`nesting_depth`、`expression_size`
    - 训练相关性：`new_vs_base`、`new_vs_old_llm`、`new_vs_new_llm`
    - 验证相关性：同上三类
    - 汇总 `train_max_corr` / `valid_max_corr`（取 base 与 old_llm 的最大者）
-8. 按 `selection.criteria` 做交集筛选（启用的规则必须全部通过）。
-9. 写记忆库：
+9. 按 `selection.criteria` 做交集筛选（启用的规则必须全部通过）。
+10. 写因子级记忆库：
    - 成功：`paths.factor_success_cases`
    - 失败：`paths.factor_failure_cases`
-10. 将通过筛选的因子追加到 `paths.llm_factor_library`。
+11. 生成本轮 `Round Packet`，总是追加到 `paths.round_memory_csv`：
+   - 包含轮级计数、成功/失败模式分布、以及本轮全部因子卡片
+   - 若 `memory.enabled=true`，再调用 round analyst LLM 生成 `round_reflection_json`
+   - round analyst 的输入保存到 `tmp/round_analyst_prompt.json`
+12. 将通过筛选的因子追加到 `paths.llm_factor_library`。
 
 说明：
 
 - 主筛选是“交集规则”。
 - 记忆库记录的是“全量评估结果”，不是只记录通过项。
+- `round_memory.csv` 是轮级账本；即使 `memory.enabled=false` 也会继续写入，只是 `round_reflection_json` 为空对象。
 
 ---
 
@@ -141,7 +153,32 @@ python scripts/workflow_llm_factors.py \
 - `base_catalog.include_llm_library_in_base`：是否把正式 LLM 库并入 base
 - 运行时会合并到：`paths.base_factor_cache_resolved`
 
-### 3.5 关键路径
+### 3.5 记忆模块
+
+- `memory.enabled`
+  - 是否启用两个 memory LLM：
+    - retrieval planner（轮前）
+    - round analyst（轮后）
+- `memory.round_analyst.recent_context_rounds`
+  - 轮后复盘时，附带最近多少轮的简短上下文
+- `memory.retrieval_planner.recent_rounds`
+  - 轮前检索读取最近多少轮 `round_memory.csv`
+- `memory.retrieval_planner.top_pass_rounds`
+  - 额外强调通过率较高的轮次
+- `memory.retrieval_planner.top_duplicate_rounds`
+  - 额外强调重复失败较多的轮次
+- `memory.retrieval_planner.tool_max_calls`
+  - retrieval planner 最多连续调用因子库查询工具的次数
+- `memory.retrieval_planner.tool_result_limit`
+  - 单次工具查询返回的最大因子数
+
+说明：
+
+- `memory.enabled=false` 时：
+  - 不调用 retrieval planner / round analyst
+  - 但仍然会写 `round_memory.csv`
+
+### 3.6 关键路径
 
 - 行情：`paths.market_data`
 - base 因子值：`paths.factor_base_parquet`
@@ -153,8 +190,14 @@ python scripts/workflow_llm_factors.py \
 - 记忆库：
   - `paths.factor_success_cases`
   - `paths.factor_failure_cases`
+  - `paths.round_memory_csv`
 
-### 3.6 记忆库字段（核心）
+运行时还会覆盖写两个调试文件（不走配置）：
+
+- `tmp/retrieval_planner_prompt.json`
+- `tmp/round_analyst_prompt.json`
+
+### 3.7 因子级记忆库字段（核心）
 
 记忆库由 `fama/memory/memory.py` 生成，成功与失败使用同一套字段。常用字段：
 
@@ -163,6 +206,47 @@ python scripts/workflow_llm_factors.py \
 - 验证指标：`valid_ic`、`valid_ric`、`valid_icir`、`valid_max_corr`、`valid_max_corr_factor_id`
 - 复杂度：`operator_count`、`nesting_depth`、`expression_size`
 - 决策结果：`final_status`、`failure_stage`、`failure_reason`
+
+### 3.8 轮级记忆（`round_memory.csv`）
+
+轮级记忆由 `fama/memory/round_memory.py` 生成，一轮一行。核心列：
+
+- 基础计数：
+  - `round_id`
+  - `batch_id`
+  - `generated_count`
+  - `success_count`
+  - `pass_rate`
+  - `weak_signal_fail_count`
+  - `stability_fail_count`
+  - `duplicate_fail_count`
+  - `complexity_fail_count`
+- 分布与原始包：
+  - `success_pattern_dist_json`
+  - `failure_pattern_dist_json`
+  - `round_packet_json`
+- 轮后 LLM 总结：
+  - `round_reflection_json`
+
+其中：
+
+- `round_packet_json` 包含本轮全部因子卡片，每张卡片都带：
+  - `factor_name`
+  - `expression`
+  - `explanation`
+  - `references`
+  - train/valid 指标
+  - corr 指标
+  - 复杂度指标
+  - `final_status`
+  - `failure_reasons`
+  - `pattern`
+- `round_reflection_json` 由 round analyst LLM 生成，包含：
+  - `round_overview`
+  - `success_patterns`
+  - `failure_patterns`
+  - `stability_observations`
+  - `next_round_guidance`
 
 ---
 
@@ -177,9 +261,16 @@ LLMQuant/
 │       └── existing_llm_factors.parquet
 ├── fama/
 │   ├── config/defaults.yaml
+│   ├── graph/
+│   │   ├── success_mainline_graph.py
+│   │   └── round_memory_progress_graph.py
 │   ├── mining/orchestrator.py
 │   ├── selection/
 │   └── memory/
+│       ├── llm_agents.py
+│       ├── memory.py
+│       ├── patterns.py
+│       └── round_memory.py
 ├── utils/
 │   ├── factor_collection_dsl.py
 │   ├── ric_engine.py
@@ -196,11 +287,16 @@ LLMQuant/
 │   ├── base_factors/
 │   └── memory/
 │       ├── factor_success_cases.csv
-│       └── factor_failure_cases.csv
+│       ├── factor_failure_cases.csv
+│       ├── round_memory.csv
+│       ├── round_generation_summary.png
+│       └── round_cumulative_success.png
 ├── factor_value_prepared/data/factors/
 │   ├── dsl_factors_new.parquet
 │   └── factor_ric.csv
 └── tmp/
+    ├── retrieval_planner_prompt.json
+    └── round_analyst_prompt.json
 ```
 
 覆盖策略（默认）：
@@ -209,6 +305,8 @@ LLMQuant/
 - `scripts/LLM_factors/dsl_LLM_factors_new.parquet` 按轮覆盖。
 - `data/factor_cache_new/LLM_library.yaml` 追加。
 - `data/memory/factor_success_cases.csv` / `data/memory/factor_failure_cases.csv` 追加。
+- `data/memory/round_memory.csv` 追加。
+- `tmp/retrieval_planner_prompt.json` / `tmp/round_analyst_prompt.json` 每轮覆盖。
 
 ---
 
@@ -222,6 +320,8 @@ LLMQuant/
 - `Window policy`（orchestrator）：CSS/CoE 的窗口与资产策略。
 - `Metrics evaluated`：本轮候选、通过、失败数量。
 - `Memory updated`：成功/失败记忆条数与目标文件。
+- `Memory retrieval ready`：轮前检索完成，打印参考因子数量与注入行数。
+- `Round memory updated`：轮级账本已写入；若记忆模块关闭，会显示 `without reflection`。
 
 ---
 
@@ -242,6 +342,15 @@ LLMQuant/
 ### 6.4 `tmp/base_factor_cache_resolved.yaml` 是否每轮生成
 
 每次 workflow 启动与 orchestrator 初始化都会按当前配置重建同一路径（覆盖写）。
+
+### 6.5 `memory.enabled=false` 时还会不会生成 `round_memory.csv`
+
+会。
+
+- 仍然会生成/追加 `round_memory.csv`
+- 仍然会写入 `round_packet_json`
+- 不会调用 retrieval planner / round analyst
+- `round_reflection_json` 会是空对象
 
 ---
 
@@ -267,6 +376,25 @@ python utils/compute_correlation_new.py \
   --base-dir data/base_factors \
   --output-dir tmp
 ```
+
+### 7.3 绘制轮级进展图
+
+```bash
+python fama/graph/round_memory_progress_graph.py
+```
+
+默认读取 `data/memory/round_memory.csv`，生成两张图：
+
+- `data/memory/round_generation_summary.png`
+  - 柱状图：每条记录的 `generated_count` / `success_count`
+  - 折线图：每条记录的 `pass_rate`
+- `data/memory/round_cumulative_success.png`
+  - 累计成功数量曲线
+
+说明：
+
+- 横坐标按 `round_memory.csv` 的行顺序编号，不使用 `round_id`，避免手动中断导致的跳号影响展示。
+- 默认每 5 个记录显示一个横轴标签。
 
 ---
 

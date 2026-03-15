@@ -200,8 +200,8 @@ def compute_rankic_table(
             ic = calculator.efficient_cal_ic(factor_clean.values, returns_clean.values)
             record["ic"] = ic
             if include_icir:
-                ic_std = calculator.efficient_cal_ic_std(factor_clean.values, returns_clean.values)
-                record["icir"] = ic / ic_std if ic_std and not pd.isna(ic_std) else pd.NA
+                icir = calculator.efficient_cal_icir(factor_clean.values, returns_clean.values)
+                record["icir"] = icir if not pd.isna(icir) else pd.NA
 
         records.append(record)
 

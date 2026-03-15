@@ -384,8 +384,7 @@ class CoEManager:
                 rets = joined.iloc[:, 1].to_numpy()
                 ric = self._ric_calc.efficent_cal_ric(values, rets)
                 ic = self._ric_calc.efficient_cal_ic(values, rets)
-                ic_std = self._ric_calc.efficient_cal_ic_std(values, rets)
-                icir = ic / ic_std if ic_std and not pd.isna(ic_std) else None
+                icir = self._ric_calc.efficient_cal_icir(values, rets)
             except Exception:
                 continue
             if pd.isna(ric):
